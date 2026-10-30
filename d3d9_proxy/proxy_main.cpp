@@ -76,6 +76,10 @@ void Log(const char* fmt, ...) {
 #define ADDR_RYU_SPAWNED        0x0058A594   // byte (1 = Ryu actor spawned & active)
 #define ADDR_RYU_MATRIX         0x004B4E50   // 4x4 float matrix (Ryu transform)
 #define ADDR_RYU_POS            0x004B5710   // vec4 float (Ryu live world position)
+#define ADDR_RYU_EVENT_LOCK     0x004B75DE   // byte (non-zero = cutscene, grab, or scripted lock on Ryu)
+#define ADDR_RYU_ACTION_ID      0x004B7640   // byte (>= 0x20 = scripted event action)
+#define ADDR_ROOM_TRANSITION    0x00D6A11E   // byte (1 = door/room transition in progress)
+#define ADDR_LIVE_BGM_TRACK     0x00D5268E   // word (currently playing live BGM track)
 
 #define ADDR_TASK1_STATE        0x007F1B12   // byte (0 = respawn Task 1, 1 = active gameplay, 2 = room load/popup)
 #define ADDR_GLOBAL_STATE       0x00DB5A60   // byte (5 = Story Gameplay, 9 = Transition, 0x0C = Mission Gameplay)
@@ -129,7 +133,10 @@ static const char* const g_HookName[4] = { "?", "RoomEnter", "ItemGet", "ShrineS
 static volatile LONG g_PumpBusyLogTick = 0;
 static volatile DWORD g_LastLoadTick = 0;
 static volatile DWORD g_LastRoomSaveTick = 0;
+static volatile DWORD g_ChapterStartTick = 0;
 static WORD g_LastRoomId = 0xFFFF;
+static BYTE g_CurrentChapter = 0;
+static BYTE g_LastSavedChapter = 0;
 
 // Game-thread detection fallback: while g_SampleActive, PumpC counts calls per thread.
 #define MAX_SAMPLE 64
@@ -152,8 +159,6 @@ static BOOL IsOurProcessForeground() {
     if (fg) GetWindowThreadProcessId(fg, &pid);
     return pid == GetCurrentProcessId();
 }
-
-static BYTE g_LastSavedChapter = 0;
 static BOOL g_AutosaveValid = FALSE;
 static char g_SlotPath[0x104] = {0};        // "U:\xxxxxxxxxxxx\" returned by the game
 static WCHAR g_SaveName[0x104 / 2] = L"Autosave";
@@ -192,8 +197,36 @@ static BOOL IsSafeToSaveNow() {
     if (*(WORD*)ADDR_RYU_HP == 0) return FALSE;               // Ryu is dead / dying
     if (*(BYTE*)ADDR_FIELD_STATE_MODE == 2) return FALSE;     // GameOver state mode
     if (*(WORD*)ADDR_CUTSCENE_ID != 0xFFFF) return FALSE;     // cutscene playing
+
+    // Chapter transition in progress
+    if (*(BYTE*)ADDR_FIELD_CHAP_TRANS != 0) return FALSE;
+
+    // Room / door transition in progress
+    if (*(BYTE*)ADDR_ROOM_TRANSITION != 0) return FALSE;
+
+    // State trigger / reload in progress
+    if (*(BYTE*)ADDR_STATE_TRIGGER != 0) return FALSE;
+
+    // Ryu locked in cutscene, grab, or scripted sequence
+    if (*(BYTE*)ADDR_RYU_EVENT_LOCK != 0) return FALSE;
+
+    // Ryu in scripted event action
+    if (*(BYTE*)ADDR_RYU_ACTION_ID >= 0x20) return FALSE;
+
+    // Grace period after chapter start (8000 ms)
+    DWORD now = GetTickCount();
+    if (now - g_ChapterStartTick < 8000) return FALSE;
+
+    // Grace period after quickload (3000 ms)
+    if (now - g_LastLoadTick < 3000) return FALSE;
+
     WORD curRoom = *(WORD*)ADDR_CURRENT_ROOM;
     if (curRoom == 0x0200 || curRoom == 0xFFFF) return FALSE; // invalid room
+
+    // Void fall safety check: do not save if Ryu's Y is below -2000.0f
+    float py = *(float*)(ADDR_RYU_POS + 4);
+    if (py < -2000.0f) return FALSE;
+
     return TRUE;
 }
 
@@ -207,7 +240,15 @@ static BOOL DoAutosave() {
 
         WORD curRoom = *(WORD*)ADDR_CURRENT_ROOM;
         WORD musicIdx = *(WORD*)0x005896EE;
-        if (musicIdx >= 0x2F) musicIdx = 0x1D;
+        // Track 0x1E is specifically the chapter clear / save screen BGM. Never record 0x1E in gameplay!
+        if (musicIdx == 0x1E || musicIdx >= 0x2F) {
+            WORD liveBgm = *(WORD*)ADDR_LIVE_BGM_TRACK;
+            if (liveBgm != 0x1E && liveBgm < 0x2F && liveBgm > 0) {
+                musicIdx = liveBgm;
+            } else {
+                musicIdx = 0; // 0 lets the game pick stage room BGM dynamically
+            }
+        }
 
         // Pack live player state, room state, and global flags into ADDR_SAVE_IMAGE (0x00572F40)
         // Mirrors 0x002FD540 without calling 0x002FD580 (which would open the interactive save UI).
@@ -227,7 +268,7 @@ static BOOL DoAutosave() {
             call eax
         }
 
-        // Ensure mid-stage packed flags are set so 0x002EC1C0 -> 0x002FC110 -> 0x002FC190(1) restores exact coords
+        // Ensure mid-stage packed flags are set in the buffer for when the save is LOADED
         *(BYTE*)ADDR_FIELD_PACKED_VALID = 1;
         *(BYTE*)ADDR_FIELD_CHAP_TRANS   = 0;
         *(BYTE*)ADDR_FIELD_WIPE_FLAG    = 0;
@@ -238,8 +279,8 @@ static BOOL DoAutosave() {
         float px = *(float*)(ADDR_RYU_POS + 0);
         float py = *(float*)(ADDR_RYU_POS + 4);
         float pz = *(float*)(ADDR_RYU_POS + 8);
-        Log("[Autosave] Saving (Chapter %d, Room 0x%04X, Pos [%.1f, %.1f, %.1f], HP %u)...\n",
-            chapter, savedRoom, px, py, pz, *(WORD*)ADDR_RYU_HP);
+        Log("[Autosave] Saving (Chapter %d, Room 0x%04X, Pos [%.1f, %.1f, %.1f], HP %u, BGM 0x%02X)...\n",
+            chapter, savedRoom, px, py, pz, *(WORD*)ADDR_RYU_HP, musicIdx);
 
         char pathOut[0x104];
         memset(pathOut, 0, sizeof(pathOut));
@@ -260,6 +301,12 @@ static BOOL DoAutosave() {
             mov res, eax
         }
 
+        // CRITICAL FIX: Immediately restore live memory PACKED_VALID = 0!
+        // PACKED_VALID = 1 is saved inside the file on disk for autoloading,
+        // but live gameplay memory MUST have PACKED_VALID = 0.
+        // If left as 1, the game bypasses real-time cutscenes (0x002DF940) and plays wrong BGM (0x002E20A5)!
+        *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
+
         if (res == 0 && pathOut[0]) {
             strcpy_s(g_SlotPath, pathOut);
             g_LastSavedChapter = chapter;
@@ -271,6 +318,7 @@ static BOOL DoAutosave() {
         }
         Log("[Autosave] Save failed, code %d, path '%s'\n", res, pathOut);
     } __except (ExcFilter(GetExceptionInformation(), "DoAutosave")) {
+        *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
     }
     return FALSE;
 }
@@ -305,23 +353,27 @@ extern "C" int __cdecl Hook_CheckpointLoad_Impl(int slotIdx) {
             BYTE loadedChapter = *(BYTE*)ADDR_FIELD_CHAPTER;
             WORD savedRoom     = *(WORD*)ADDR_FIELD_SAVED_ROOM;
             WORD spawnId       = *(WORD*)ADDR_FIELD_SPAWN_POINT;
+            BYTE wasPacked     = *(BYTE*)ADDR_FIELD_PACKED_VALID;
 
-            // Ensure mid-stage packed flags are set so 0x002EC1C0 -> 0x002FC110 -> 0x002FC190(1) restores coords
+            // Ensure state mode is Alive
             *(BYTE*)ADDR_FIELD_STATE_MODE   = 1; // Alive
-            *(BYTE*)ADDR_FIELD_PACKED_VALID = 1; // Packed live state valid
-            *(BYTE*)ADDR_FIELD_CHAP_TRANS   = 0;
             *(BYTE*)ADDR_FIELD_WIPE_FLAG    = 0;
             *(BYTE*)ADDR_FIELD_SLOT_INDEX   = 0;
+            if (wasPacked) {
+                *(BYTE*)ADDR_FIELD_PACKED_VALID = 1;
+                *(BYTE*)ADDR_FIELD_CHAP_TRANS   = 0;
+            }
 
             // Synchronize checkpoint backup buffer (0x007F1CA0) with the loaded image
             memcpy((void*)0x007F1CA0, (void*)ADDR_SAVE_IMAGE, SIZE_SAVE_IMAGE);
 
             g_LastLoadTick = GetTickCount();
             g_LastRoomId   = savedRoom;
+            g_CurrentChapter = loadedChapter;
             g_AutoloadPending = 0;
 
-            Log("[Autosave] Autoload successful (Chapter %d, Room 0x%04X, Spawn 0x%04X) -> resuming via native State 9 -> State 5\n",
-                loadedChapter, savedRoom, spawnId);
+            Log("[Autosave] Autoload successful (Chapter %d, Room 0x%04X, Spawn 0x%04X, Packed %d) -> resuming via native State 9 -> State 5\n",
+                loadedChapter, savedRoom, spawnId, wasPacked);
             return 1;
         }
         Log("[Autosave] Autoload failed with code: %d\n", res);
@@ -339,21 +391,33 @@ extern "C" void __cdecl QueueSaveC(int src) {
     g_GameTid = tid;
 
     DWORD now = GetTickCount();
+
+    // Suppress saving during chapter start grace period (8000ms)
+    if (now - g_ChapterStartTick < 8000) {
+        Log("[Autosave] [Hook:%s] suppressed (chapter start grace period, %u ms)\n",
+            g_HookName[src & 3], now - g_ChapterStartTick);
+        return;
+    }
+
+    // Suppress saving during quickload grace period (3000ms)
+    if (now - g_LastLoadTick < 3000) {
+        Log("[Autosave] [Hook:%s] suppressed (quickload in progress, %u ms ago)\n",
+            g_HookName[src & 3], now - g_LastLoadTick);
+        return;
+    }
+
+    // Suppress if chapter transition flag is active
+    if (*(BYTE*)ADDR_FIELD_CHAP_TRANS != 0) {
+        Log("[Autosave] [Hook:%s] suppressed (chapter transition active)\n", g_HookName[src & 3]);
+        return;
+    }
+
     if (src == SRC_ROOM) {
-        // Suppress room auto-save if an autoload just occurred
-        if (now - g_LastLoadTick < 3000) {
-            Log("[Autosave] [Hook:RoomEnter] suppressed (reload in progress, %u ms ago)\n", now - g_LastLoadTick);
-            return;
-        }
         // Debounce frequent room transitions
         if (now - g_LastRoomSaveTick < 2000) {
             return;
         }
         g_LastRoomSaveTick = now;
-    } else if (src == SRC_ITEM) {
-        if (now - g_LastLoadTick < 2000) {
-            return;
-        }
     }
 
     LONG n = InterlockedIncrement(&g_HookCount[src & 3]);
@@ -368,8 +432,35 @@ extern "C" void __cdecl PumpC() {
     if (g_GameTid == 0 || GetCurrentThreadId() != g_GameTid) return;
     if (g_InPump) return;
 
+    BYTE curChapter = *(BYTE*)ADDR_FIELD_CHAPTER;
+    DWORD now = GetTickCount();
+
+    // 1. Chapter Change Detection:
+    // If the chapter ID changed (e.g. Chapter 3 -> Chapter 4), clear any pending autosave,
+    // synchronize room ID, and start the chapter grace period timer!
+    if (g_CurrentChapter == 0) {
+        g_CurrentChapter = curChapter;
+        g_LastSavedChapter = curChapter;
+        g_LastRoomId = *(WORD*)ADDR_CURRENT_ROOM;
+        g_ChapterStartTick = now;
+    } else if (curChapter != 0 && curChapter != g_CurrentChapter) {
+        Log("[Autosave] Chapter transition detected: Chapter %u -> Chapter %u\n", g_CurrentChapter, curChapter);
+        g_CurrentChapter = curChapter;
+        g_LastSavedChapter = curChapter;
+        g_LastRoomId = *(WORD*)ADDR_CURRENT_ROOM;
+        InterlockedExchange(&g_PendingSave, 0);
+        g_ChapterStartTick = now;
+        *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
+    }
+
+    // 2. Room Change Detection:
     // Track room ID changes during active gameplay (catches both non-seamless 0x2DF930 and seamless 0x2EF3F0 doors)
     if (IsSafeToSaveNow()) {
+        // Enforce PACKED_VALID is 0 during active gameplay
+        if (*(BYTE*)ADDR_FIELD_PACKED_VALID != 0) {
+            *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
+        }
+
         WORD curRoom = *(WORD*)ADDR_CURRENT_ROOM;
         if (g_LastRoomId == 0xFFFF) {
             g_LastRoomId = curRoom;
@@ -386,9 +477,8 @@ extern "C" void __cdecl PumpC() {
     // Never interrupt the game's own save routine (it owns the global pool while running)
     DWORD pool = *(volatile DWORD*)ADDR_SAVE_POOL;
     if (pool != 0) {
-        LONG now = (LONG)GetTickCount();
-        if (now - g_PumpBusyLogTick > 2000) {   // throttled
-            g_PumpBusyLogTick = now;
+        if ((LONG)now - g_PumpBusyLogTick > 2000) {   // throttled
+            g_PumpBusyLogTick = (LONG)now;
             Log("[Autosave] [Pump] request pending but save pool busy (0x%08X) - waiting\n", pool);
         }
         return;
@@ -424,11 +514,6 @@ extern "C" void __cdecl PumpC() {
         // so Ryu's live coordinates and the new room/inventory state are completely settled.
         if (IsSafeToSaveNow()) {
             if (InterlockedCompareExchange(&g_PendingSave, 0, 1) == 1) {
-                BYTE curChapter = *(BYTE*)ADDR_FIELD_CHAPTER;
-                if (g_LastSavedChapter != 0 && curChapter != g_LastSavedChapter) {
-                    Log("[Autosave] Chapter transition (%d -> %d) -> updating autosave slot\n",
-                        g_LastSavedChapter, curChapter);
-                }
                 DoAutosave();
             }
         }
@@ -443,6 +528,9 @@ extern "C" void __cdecl PumpC() {
 static void __declspec(naked) Hook_DoorEnter_Stub() {
     __asm {
         mov word ptr ds:[0x00DB9AC2], bx
+        // Must NOT be in chapter transition
+        cmp byte ptr ds:[0x0058A389], 0
+        jne SkipDoorSave
         pushad
         pushfd
         mov g_LastRoomId, bx
@@ -451,6 +539,7 @@ static void __declspec(naked) Hook_DoorEnter_Stub() {
         add esp, 4
         popfd
         popad
+    SkipDoorSave:
         push 0x002EF5D2
         ret
     }
@@ -463,10 +552,40 @@ static void __declspec(naked) Hook_ItemGet_Stub() {
     __asm {
         test ebx, ebx
         jle SkipItemSave
+        // Must be in active Story mode
         cmp byte ptr ds:[0x00DB5A60], 5
         jne SkipItemSave
+        // Must NOT be in chapter transition
+        cmp byte ptr ds:[0x0058A389], 0
+        jne SkipItemSave
+        // Ryu must be spawned and active
         cmp byte ptr ds:[0x0058A594], 1
         jne SkipItemSave
+        // Ryu must NOT be locked in cutscene / event
+        cmp byte ptr ds:[0x004B75DE], 0
+        jne SkipItemSave
+        // Ryu action ID must be normal gameplay (< 0x20)
+        cmp byte ptr ds:[0x004B7640], 0x20
+        jae SkipItemSave
+        // Cutscene must not be playing
+        cmp word ptr ds:[0x00DB9C6E], 0xFFFF
+        jne SkipItemSave
+        // Room transition must not be active
+        cmp byte ptr ds:[0x00D6A11E], 0
+        jne SkipItemSave
+        // Pause menu must not be open
+        cmp byte ptr ds:[0x00DB5A68], 0
+        jne SkipItemSave
+        // State trigger must not be set
+        cmp byte ptr ds:[0x00DB9AD6], 0
+        jne SkipItemSave
+        // Task 1 must be active gameplay (1)
+        cmp byte ptr ds:[0x007F1B12], 1
+        jne SkipItemSave
+        // Stage substate must be active room (3)
+        cmp byte ptr ds:[0x00DB9894], 3
+        jne SkipItemSave
+
         pushad
         pushfd
         push SRC_ITEM
@@ -484,17 +603,34 @@ static void __declspec(naked) Hook_ItemGet_Stub() {
     }
 }
 
-// 3. Dragon Statue save hook at 0x001DA15F (5 bytes replaced)
+// 3. Dragon Statue / Chapter Clear save hook at 0x001DA15F (5 bytes replaced)
 // Original: E8 DC 56 13 00 (call 0x0030F840)
+// Args to 0x0030F840: edx = esi = pathOut, [esp] = name, [esp+4] = save image, [esp+8] = size
+extern "C" void __cdecl Hook_ShrineSave_Callback(int res, const char* pathOut) {
+    if (res == 0 && pathOut && pathOut[0]) {
+        strcpy_s(g_SlotPath, pathOut);
+        g_AutosaveValid = TRUE;
+        g_LastSavedChapter = *(BYTE*)ADDR_FIELD_CHAPTER;
+        FILE* f = fopen(g_SlotFile, "w");
+        if (f) { fprintf(f, "%s\n", g_SlotPath); fclose(f); }
+        Log("[Autosave] [NativeSave] Saved to slot '%s' (Chapter %d, Room 0x%04X, ChapTrans %d)\n",
+            g_SlotPath, *(BYTE*)ADDR_FIELD_CHAPTER, *(WORD*)ADDR_FIELD_SAVED_ROOM, *(BYTE*)ADDR_FIELD_CHAP_TRANS);
+    }
+    // Cancel any pending autosave so transition/next chapter starts completely clean
+    InterlockedExchange(&g_PendingSave, 0);
+    InterlockedIncrement(&g_HookCount[SRC_SHRINE]);
+}
+
 static void __declspec(naked) Hook_ShrineSave_Stub() {
     __asm {
         mov eax, 0x0030F840
         call eax
         pushad
         pushfd
-        push SRC_SHRINE
-        call QueueSaveC
-        add esp, 4
+        push esi              // pathOut
+        push eax              // res
+        call Hook_ShrineSave_Callback
+        add esp, 8
         popfd
         popad
         push 0x001DA164
