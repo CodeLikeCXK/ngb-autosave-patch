@@ -1030,8 +1030,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDeviceEx(IDirect3D9Ex* d3d, UINT ada
 #define ADDR_RYU_SPAWNED        0x0058A594   // byte (non-zero = Ryu actor spawned & active)
 #define ADDR_RYU_MATRIX         0x004B4E50   // 4x4 float matrix (Ryu transform)
 #define ADDR_RYU_POS            0x004B5710   // vec4 float (Ryu live world position)
-#define ADDR_RYU_EVENT_LOCK     0x004B75DE   // byte (+ actorSlot * 0x2800: non-zero = cutscene/grab/scripted lock)
-#define ADDR_ACTOR_SLOT_INDEX   0x00DB9C60   // byte (active player actor slot index, stride 0x2800)
+#define ADDR_RYU_EVENT_LOCK     0x004B75DE   // byte (Ryu Actor 0 lock/state byte, read directly without actorSlot offset)
 #define ADDR_ROOM_TRANSITION    0x00D6A11E   // byte (1 = door/room transition in progress)
 #define ADDR_LIVE_BGM_TRACK     0x00D5268E   // word (currently playing live BGM track)
 
@@ -1044,7 +1043,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDeviceEx(IDirect3D9Ex* d3d, UINT ada
 #define ADDR_STATE_TRIGGER      0x00DB9AD6   // byte (3/4 = stop tasks & trigger State 9 checkpoint load)
 #define ADDR_CUTSCENE_STATE     0x008D3A50   // word (0xFFFF / 1 / 2 = cutscene playing per 0x001DBA70; 0 / 3 = finished)
 #define ADDR_CUTSCENE_ID        0x00DB9C6E   // word (cutscene ID; NOT cleared to 0xFFFF after some cutscenes!)
-#define ADDR_INTERACTION_LOCK   0x00D52B37   // byte (1 = door/chest/safe/shrine interaction active)
+// Note: 0x00D52B37 is set to 1 every frame in stage loop (0x002DF631) and must NOT be used as an interaction lock!
 #define ADDR_SAVE_POOL          0x00C05FE8   // dword: heap used by the save routines while they run
 
 // Xbox controller internal button bitmask in default.xbe (+0x08 into 0x78-byte pad struct; +0x00 is dwPacketNumber!)
@@ -1066,13 +1065,22 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDeviceEx(IDirect3D9Ex* d3d, UINT ada
 
 // Hook sites
 #define ADDR_HOOK_DOOR          0x002EF5CB   // Seamless door room update: mov [0xdb9ac2], bx (7 bytes)
-#define ADDR_HOOK_ITEM          0x00154300   // Inventory item add/remove (6 bytes: 51 55 56 83 CA FF)
+// ADDR_HOOK_ITEM (0x00154300) and ADDR_HOOK_SOBJ_INTERACT (0x002DF57F) removed per user requirement:
+// prevents undesirable autosaves during chests, levers, puzzles, or Chapter 6 chalice altar boss trigger.
+#define ADDR_HOOK_SAVE_ENUM     0x001DA26D   // Save enum slot filter in 0x001da220 (11 bytes)
+#define ADDR_HOOK_GAMEOVER_CONTINUE 0x002E0C9F // GameOver Continue slot check: cmp [0x58a38a], 0xff (7 bytes)
 #define ADDR_HOOK_SHRINE_NEW    0x001DA15F   // Dragon statue / Chapter clear save (NEW slot): call 0x30f840 (5 bytes)
 #define ADDR_HOOK_SHRINE_OVER   0x001DA1EE   // Dragon statue / Chapter clear save (OVERWRITE slot): call 0x30f840 (5 bytes)
 #define ADDR_HOOK_CASE3_LOAD    0x0016656A   // State 9 Case 3/4 checkpoint load: call 0x16b680 (5 bytes)
 #define ADDR_HOOK_GAMEOVER_TICK 0x002E08EA   // GameOver loop tick: call 0x2026f0 (5 bytes)
 #define ADDR_HOOK_USE_SPIRIT    0x001E23D6   // Spirit of the Devils MaxKi write: mov [edx+1cc], ax (7 bytes)
 #define ADDR_HOOK_UNPACK_KI     0x002FC270   // Stage unpack MaxKi write: mov [0x58a56c], cx (7 bytes)
+
+// Difficulty unlock patch sites (0x001DB598 jump table entries for IsFeatureUnlocked)
+#define ADDR_UNLOCK_HARD        0x001DB5B4   // Case 7 (Hard)
+#define ADDR_UNLOCK_VERY_HARD   0x001DB5B8   // Case 8 (Very Hard)
+#define ADDR_UNLOCK_MASTER_NINJA 0x001DB5BC  // Case 9 (Master Ninja)
+#define ADDR_UNLOCK_TARGET_FUNC 0x001DB590   // mov eax, 1; ret
 
 // Global state
 static volatile LONG g_PendingSave = 0;
@@ -1082,19 +1090,38 @@ static volatile LONG g_AutoloadPending = 0;
 static volatile DWORD g_GameTid = 0;
 
 // Diagnostics: how often each hook fired (source ids for QueueSaveC)
-#define SRC_ROOM   1
-#define SRC_ITEM   2
-#define SRC_SHRINE 3
-static volatile LONG g_HookCount[4] = {0, 0, 0, 0};
-static const char* const g_HookName[4] = { "?", "RoomEnter", "ItemGet", "ShrineSave" };
+#define SRC_DOOR            1  // 开门进入下一个房间时 (Door Transition / Room Change)
+#define SRC_CHAPTER_START   2  // 关卡开始时 (Level / Chapter Start)
+#define SRC_ENEMY_ENCOUNTER 3  // 遭遇敌人时 (Enemy Encounter / Battle Start)
+#define SRC_SHRINE          4  // 龙之雕像手动保存同步 (Dragon Shrine sync)
+static volatile LONG g_HookCount[5] = {0, 0, 0, 0, 0};
+static const char* const g_HookName[5] = { "Unknown", "DoorEnter", "ChapterStart", "Encounter", "ShrineSave" };
 static volatile LONG g_PumpBusyLogTick = 0;
 static volatile LONG g_SaveWaitLogTick = 0;
 static volatile DWORD g_LastLoadTick = 0;
 static volatile DWORD g_LastRoomSaveTick = 0;
+static volatile DWORD g_LastEncounterSaveTick = 0;
 static volatile DWORD g_ChapterStartTick = 0;
 static WORD g_LastRoomId = 0xFFFF;
-static BYTE g_CurrentChapter = 0;
-static BYTE g_LastSavedChapter = 0;
+static BYTE g_CurrentChapter = 0xFF;
+static BYTE g_LastSavedChapter = 0xFF;
+static int g_LastEnemyCount = 0;
+static BOOL g_ChapterSavePending = FALSE;
+
+// Counts active spawned enemies with HP > 0 in actor slots 1..63 (slot 0 is player Ryu)
+static int GetActiveEnemyCount() {
+    int count = 0;
+    for (int i = 1; i < 64; i++) {
+        DWORD actorBase = 0x0058A3A0 + (DWORD)i * 0x210;
+        if (*(BYTE*)(actorBase + 0x1F4) != 0) { // is_spawned
+            WORD hp = *(WORD*)(actorBase + 0x1CC);
+            if (hp > 0 && hp != 0xFFFF) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
 
 // Game-thread detection fallback: while g_SampleActive, PumpC counts calls per thread.
 #define MAX_SAMPLE 64
@@ -1111,6 +1138,11 @@ static void SampleThread() {
     }
 }
 
+static BOOL IsMapped(DWORD addr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery((void*)addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT;
+}
+
 static BOOL IsOurProcessForeground() {
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
@@ -1123,6 +1155,91 @@ static char g_SlotPath[0x104] = {0};        // "U:\xxxxxxxxxxxx\" returned by th
 static WCHAR g_SaveName[0x104 / 2] = L"Autosave";
 static char g_SlotFile[MAX_PATH] = {0};     // remembers g_SlotPath across game restarts
 
+static BOOL VerifySaveSlotOnDisk(const char* slotPath) {
+    if (!slotPath || !slotPath[0]) return FALSE;
+    const char* p = slotPath;
+    if ((p[0] == 'U' || p[0] == 'u') && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) {
+        p += 3;
+    }
+    char subDir[64] = {0};
+    int i = 0;
+    while (*p && *p != '\\' && *p != '/' && i < 60) {
+        subDir[i++] = *p++;
+    }
+    subDir[i] = 0;
+    if (i == 0) return FALSE;
+
+    char checkPath[MAX_PATH];
+    sprintf_s(checkPath, "savedata\\Partition1\\UDATA\\5443000d\\%s\\save000.dat", subDir);
+    DWORD attr = GetFileAttributesA(checkPath);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return FALSE;
+    }
+
+    HANDLE hFile = CreateFileA(checkPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    DWORD sz = GetFileSize(hFile, NULL);
+    CloseHandle(hFile);
+    return (sz > 1000);
+}
+
+static BOOL ScanDiskForAutosaveSlot(char* outSlotPath, size_t maxLen) {
+    char searchPattern[MAX_PATH];
+    sprintf_s(searchPattern, "savedata\\Partition1\\UDATA\\5443000d\\*");
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(searchPattern, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return FALSE;
+
+    BOOL found = FALSE;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            strcmp(fd.cFileName, ".") != 0 && strcmp(fd.cFileName, "..") != 0) {
+
+            char metaPath[MAX_PATH];
+            sprintf_s(metaPath, "savedata\\Partition1\\UDATA\\5443000d\\%s\\SaveMeta.xbx", fd.cFileName);
+
+            FILE* mf = fopen(metaPath, "rb");
+            if (mf) {
+                BYTE metaBuf[256] = {0};
+                size_t readBytes = fread(metaBuf, 1, sizeof(metaBuf) - 2, mf);
+                fclose(mf);
+                if (readBytes > 4) {
+                    // Check UTF-16LE sequence for "Autosave"
+                    static const BYTE needle[] = { 'A', 0, 'u', 0, 't', 0, 'o', 0, 's', 0, 'a', 0, 'v', 0, 'e', 0 };
+                    BOOL match = FALSE;
+                    for (size_t k = 0; k + sizeof(needle) <= readBytes; ++k) {
+                        if (memcmp(metaBuf + k, needle, sizeof(needle)) == 0) {
+                            match = TRUE;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        char datPath[MAX_PATH];
+                        sprintf_s(datPath, "savedata\\Partition1\\UDATA\\5443000d\\%s\\save000.dat", fd.cFileName);
+                        DWORD datAttr = GetFileAttributesA(datPath);
+                        if (datAttr != INVALID_FILE_ATTRIBUTES && !(datAttr & FILE_ATTRIBUTE_DIRECTORY)) {
+                            HANDLE hf = CreateFileA(datPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+                            if (hf != INVALID_HANDLE_VALUE) {
+                                DWORD sz = GetFileSize(hf, NULL);
+                                CloseHandle(hf);
+                                if (sz > 1000) {
+                                    sprintf_s(outSlotPath, maxLen, "U:\\%s\\", fd.cFileName);
+                                    found = TRUE;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } while (FindNextFileA(hFind, &fd));
+    FindClose(hFind);
+    return found;
+}
+
 static void InitPaths() {
     GetFullPathNameA("autosave_slot.txt", MAX_PATH, g_SlotFile, NULL);
     FILE* f = fopen(g_SlotFile, "r");
@@ -1131,11 +1248,31 @@ static void InitPaths() {
         if (fgets(buf, sizeof(buf), f)) {
             size_t n = strlen(buf);
             while (n && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = 0;
-            if (n > 2) { memcpy(g_SlotPath, buf, n + 1); g_AutosaveValid = TRUE; }
+            if (n > 2 && VerifySaveSlotOnDisk(buf)) {
+                memcpy(g_SlotPath, buf, n + 1);
+                g_AutosaveValid = TRUE;
+            } else {
+                Log("[Autosave] Slot in file '%s' ('%s') is invalid or missing on disk.\n", g_SlotFile, buf);
+            }
         }
         fclose(f);
     }
-    Log("[Autosave] Slot file: %s, remembered slot: '%s'\n", g_SlotFile, g_SlotPath);
+
+    if (!g_AutosaveValid) {
+        char diskSlot[0x104] = {0};
+        if (ScanDiskForAutosaveSlot(diskSlot, sizeof(diskSlot))) {
+            strcpy_s(g_SlotPath, diskSlot);
+            g_AutosaveValid = TRUE;
+            FILE* fw = fopen(g_SlotFile, "w");
+            if (fw) { fprintf(fw, "%s\n", g_SlotPath); fclose(fw); }
+            Log("[Autosave] Discovered existing autosave slot on disk: '%s', updated slot file.\n", g_SlotPath);
+        } else {
+            g_SlotPath[0] = 0;
+            Log("[Autosave] No valid autosave slot found on disk yet. Ready to create on first save.\n");
+        }
+    } else {
+        Log("[Autosave] Verified valid autosave slot: '%s'\n", g_SlotPath);
+    }
 }
 
 static LONG ExcFilter(EXCEPTION_POINTERS* ep, const char* where) {
@@ -1169,7 +1306,6 @@ static BOOL IsSafeToSaveNow(const char** outBlockReason = NULL) {
     if (*(BYTE*)ADDR_TASK1_STATE != 1) FAIL_SAVE("Task1State!=1");
     if (*(BYTE*)ADDR_STAGE_SUBSTATE != 3) FAIL_SAVE("StageSubState!=3");
     if (*(BYTE*)ADDR_PAUSE_DEPTH != 0) FAIL_SAVE("Paused");
-    if (*(BYTE*)ADDR_INTERACTION_LOCK != 0) FAIL_SAVE("InteractionLock");
     if (*(BYTE*)ADDR_RYU_SPAWNED == 0) FAIL_SAVE("RyuNotSpawned");
     if (*(WORD*)ADDR_RYU_HP == 0) FAIL_SAVE("RyuHP==0");
     if (*(BYTE*)ADDR_FIELD_STATE_MODE == 2) FAIL_SAVE("GameOverMode");
@@ -1178,9 +1314,7 @@ static BOOL IsSafeToSaveNow(const char** outBlockReason = NULL) {
     if (*(BYTE*)ADDR_ROOM_TRANSITION != 0) FAIL_SAVE("RoomTransition");
     if (*(BYTE*)ADDR_STATE_TRIGGER != 0) FAIL_SAVE("StateTrigger");
 
-    BYTE actorSlot = *(BYTE*)ADDR_ACTOR_SLOT_INDEX;
-    DWORD actorOff = (actorSlot < 4) ? ((DWORD)actorSlot * 0x2800u) : 0;
-    if (*(BYTE*)(ADDR_RYU_EVENT_LOCK + actorOff) != 0) FAIL_SAVE("RyuEventLock");
+    if (*(BYTE*)ADDR_RYU_EVENT_LOCK != 0) FAIL_SAVE("RyuEventLock");
 
     DWORD now = GetTickCount();
     if (now - g_ChapterStartTick < 2000) FAIL_SAVE("ChapterGracePeriod");
@@ -1295,9 +1429,10 @@ static BOOL DoAutosave() {
 extern "C" int __cdecl Hook_CheckpointLoad_Impl(int slotIdx) {
     if (g_AutoloadPending) {
         if (!g_AutosaveValid || !g_SlotPath[0]) {
-            Log("[Autosave] Autoload requested but no valid slot exists\n");
+            Log("[Autosave] Autoload requested but no valid slot exists, falling back to native checkpoint\n");
             g_AutoloadPending = 0;
-            return 0;
+            typedef int (__cdecl *PFN_LoadCheckpoint)(int);
+            return ((PFN_LoadCheckpoint)0x0016B680)(slotIdx);
         }
         Log("[Autosave] State 9 Case 4: loading autosave from '%s' into 0x00572F40...\n", g_SlotPath);
         const char* path = g_SlotPath;
@@ -1355,9 +1490,10 @@ extern "C" int __cdecl Hook_CheckpointLoad_Impl(int slotIdx) {
                 loadedChapter, savedRoom, spawnId, wasPacked);
             return 1;
         }
-        Log("[Autosave] Autoload failed with code: %d\n", res);
+        Log("[Autosave] Autoload failed with code: %d, falling back to native checkpoint\n", res);
         g_AutoloadPending = 0;
-        return 0;
+        typedef int (__cdecl *PFN_LoadCheckpoint)(int);
+        return ((PFN_LoadCheckpoint)0x0016B680)(slotIdx);
     }
 
     // Normal checkpoint load: call original 0x0016B680
@@ -1369,14 +1505,16 @@ extern "C" void __cdecl QueueSaveC(int src) {
     DWORD tid = GetCurrentThreadId();   // these hooks all fire on the game thread
     g_GameTid = tid;
 
+    const char* hookTag = (src > 0 && src <= 4) ? g_HookName[src] : "?";
+
     // Suppress only if end-of-chapter transition flag is active; otherwise queue and let PumpC wait until settled!
     if (*(BYTE*)ADDR_FIELD_CHAP_TRANS != 0) {
-        Log("[Autosave] [Hook:%s] suppressed (chapter transition active)\n", g_HookName[src & 3]);
+        Log("[Autosave] [Hook:%s] suppressed (chapter transition active)\n", hookTag);
         return;
     }
 
     DWORD now = GetTickCount();
-    if (src == SRC_ROOM) {
+    if (src == SRC_DOOR) {
         // Debounce back-to-back duplicate notifications for the same door
         if (now - g_LastRoomSaveTick < 1500) {
             return;
@@ -1384,9 +1522,10 @@ extern "C" void __cdecl QueueSaveC(int src) {
         g_LastRoomSaveTick = now;
     }
 
-    LONG n = InterlockedIncrement(&g_HookCount[src & 3]);
+    int hookIdx = (src > 0 && src <= 4) ? src : 0;
+    LONG n = InterlockedIncrement(&g_HookCount[hookIdx]);
     Log("[Autosave] [Hook:%s] fired #%d on thread %u -> queue save\n",
-        g_HookName[src & 3], n, tid);
+        hookTag, n, tid);
     InterlockedExchange(&g_PendingSave, 1);
 }
 
@@ -1409,6 +1548,21 @@ extern "C" void __cdecl PumpC() {
     BYTE subState = *(BYTE*)ADDR_STAGE_SUBSTATE;
     DWORD now     = GetTickCount();
 
+    // Difficulty Unlocks Sync (Hard, Very Hard, Master Ninja in T:\system.dat memory)
+    if (IsMapped(0x00DB93FC) && *(DWORD*)0x00DB93FC == 0x20030730) {
+        if (*(BYTE*)0x00DB9472 == 0) *(BYTE*)0x00DB9472 = 1; // Hard
+        if (*(BYTE*)0x00DB9473 == 0) *(BYTE*)0x00DB9473 = 1; // Very Hard
+        if (*(BYTE*)0x00DB9474 == 0) *(BYTE*)0x00DB9474 = 1; // Master Ninja
+    }
+
+    // Reset chapter/room tracking when back on Title / Menus so a New Game in Chapter 1 (index 0) re-arms cleanly
+    if (gstate != 5 && gstate != 0x0C && gstate != 9 && subState != 0x80) {
+        g_CurrentChapter = 0xFF;
+        g_LastRoomId = 0xFFFF;
+        g_ChapterSavePending = FALSE;
+        g_LastEnemyCount = 0;
+    }
+
     // CRITICAL FIX FOR HAN'S BAR / CUTSCENE DOORS:
     // Clear PACKED_VALID on the VERY FIRST active gameplay frame (NEVER gated behind grace period timers!).
     // STAGE_UNPACK / UNPACK_PLAYER (0x002FC110) already consumed PACKED_VALID while Task1State == 0.
@@ -1422,22 +1576,32 @@ extern "C" void __cdecl PumpC() {
             *(BYTE*)ADDR_BACKUP_PACKED_VAL = 0;
         }
 
-        // 1. Live Chapter Change Detection (using real live chapter 0x00DB9AD4, NOT difficulty 0x00589755!)
+        // 1. Live Chapter Change & Initial Chapter Detection (0x00DB9AD4 is 0-indexed: 0 = Chapter 1)
         BYTE curChapter = *(BYTE*)ADDR_LIVE_CHAPTER;
-        if (curChapter != 0) {
-            if (g_CurrentChapter == 0) {
+        if (curChapter != 0xFF) {
+            if (g_CurrentChapter == 0xFF) {
                 g_CurrentChapter = curChapter;
                 g_LastSavedChapter = curChapter;
                 g_LastRoomId = *(WORD*)ADDR_CURRENT_ROOM;
                 g_ChapterStartTick = now;
+                g_ChapterSavePending = TRUE;
+                Log("[Autosave] Initial chapter detected: Chapter %u -> arm level start autosave\n", curChapter + 1);
             } else if (curChapter != g_CurrentChapter) {
-                Log("[Autosave] Chapter transition detected: Chapter %u -> Chapter %u\n", g_CurrentChapter, curChapter);
+                Log("[Autosave] Chapter transition detected: Chapter %u -> Chapter %u\n", g_CurrentChapter + 1, curChapter + 1);
                 g_CurrentChapter = curChapter;
                 g_LastSavedChapter = curChapter;
                 g_LastRoomId = *(WORD*)ADDR_CURRENT_ROOM;
                 g_ChapterStartTick = now;
-                // Queue an initial autosave for the newly entered chapter once settled!
-                InterlockedExchange(&g_PendingSave, 1);
+                g_ChapterSavePending = TRUE;
+            }
+        }
+
+        // Trigger Chapter Start autosave once the chapter grace period (2.0s) has elapsed
+        if (g_ChapterSavePending && (now - g_ChapterStartTick >= 2000)) {
+            if (!IsCutscenePlayingNow()) {
+                g_ChapterSavePending = FALSE;
+                Log("[Autosave] Level start settled (Chapter %u) -> queue autosave\n", g_CurrentChapter + 1);
+                QueueSaveC(SRC_CHAPTER_START);
             }
         }
 
@@ -1449,13 +1613,30 @@ extern "C" void __cdecl PumpC() {
             } else if (curRoom != g_LastRoomId) {
                 WORD prevRoom = g_LastRoomId;
                 g_LastRoomId = curRoom;
-                Log("[Autosave] Room transition detected: 0x%04X -> 0x%04X (Chapter %u)\n",
+                Log("[Autosave] Door transition to next room: 0x%04X -> 0x%04X (Chapter %u)\n",
                     prevRoom, curRoom, *(BYTE*)ADDR_LIVE_CHAPTER);
-                QueueSaveC(SRC_ROOM);
+                QueueSaveC(SRC_DOOR);
             }
         }
 
-        // 3. Ninpo / Ki Auto-Recovery Guard:
+        // 3. Enemy Encounter Detection (Enemies spawned from 0 -> >0)
+        int curEnemies = GetActiveEnemyCount();
+        if (g_LastEnemyCount == 0 && curEnemies > 0) {
+            // Transition from peace to combat encounter!
+            if (now - g_LastEncounterSaveTick >= 5000 &&
+                now - g_LastRoomSaveTick >= 2500 &&
+                now - g_ChapterStartTick >= 2000 &&
+                !IsCutscenePlayingNow()) {
+                g_LastEncounterSaveTick = now;
+                Log("[Autosave] Enemy encounter detected! Active enemies: %d -> queue autosave\n", curEnemies);
+                QueueSaveC(SRC_ENEMY_ENCOUNTER);
+            }
+        } else if (g_LastEnemyCount > 0 && curEnemies == 0) {
+            Log("[Autosave] Battle encounter cleared (all enemies defeated).\n");
+        }
+        g_LastEnemyCount = curEnemies;
+
+        // 4. Ninpo / Ki Auto-Recovery Guard:
         // If player has equipped a Ninpo scroll (e.g. 0x009B) but MaxKi < 200 (corrupted/zeroed state),
         // auto-recover MaxKi to 400 (2 full slots) and refill CurKi to 400, syncing to save buffer!
         WORD curMaxKi = *(WORD*)ADDR_RYU_MAX_KI;
@@ -1537,7 +1718,7 @@ static void __declspec(naked) Hook_DoorEnter_Stub() {
         pushad
         pushfd
         mov g_LastRoomId, bx
-        push SRC_ROOM
+        push SRC_DOOR
         call QueueSaveC
         add esp, 4
         popfd
@@ -1548,64 +1729,15 @@ static void __declspec(naked) Hook_DoorEnter_Stub() {
     }
 }
 
-// 2. Inventory item acquisition / Chest & Safe reward hook at 0x00154300 (6 bytes replaced)
-// Original: 51 55 56 83 CA FF (push ecx; push ebp; push esi; or edx, 0xffffffff)
-// Args: eax = item_id, ebx = count (> 0 when acquiring an item, < 0 when removing/consuming)
-static void __declspec(naked) Hook_ItemGet_Stub() {
-    __asm {
-        test ebx, ebx
-        jle SkipItemSave
-        cmp byte ptr ds:[0x00DB5A60], 5
-        jne SkipItemSave
-        cmp byte ptr ds:[0x0058A389], 0
-        jne SkipItemSave
-        cmp byte ptr ds:[0x0058A594], 0
-        je SkipItemSave
-        cmp word ptr ds:[0x008D3A50], 0xFFFF
-        je SkipItemSave
-        cmp word ptr ds:[0x008D3A50], 1
-        je SkipItemSave
-        cmp word ptr ds:[0x008D3A50], 2
-        je SkipItemSave
-        cmp byte ptr ds:[0x00D6A11E], 0
-        jne SkipItemSave
-        cmp byte ptr ds:[0x00DB5A68], 0
-        jne SkipItemSave
-        cmp byte ptr ds:[0x00DB9AD6], 0
-        jne SkipItemSave
-        cmp byte ptr ds:[0x007F1B12], 1
-        jne SkipItemSave
-        cmp byte ptr ds:[0x00DB9894], 3
-        jne SkipItemSave
-
-        pushad
-        pushfd
-        push SRC_ITEM
-        call QueueSaveC
-        add esp, 4
-        popfd
-        popad
-    SkipItemSave:
-        push ecx
-        push ebp
-        push esi
-        or edx, 0xFFFFFFFF
-        push 0x00154306
-        ret
-    }
-}
-
-// 3a & 3b. Dragon Statue / Chapter Clear save hooks at BOTH 0x001DA15F (new slot) and 0x001DA1EE (overwrite slot)
+// 2a & 2b. Dragon Statue / Chapter Clear save hooks at BOTH 0x001DA15F (new slot) and 0x001DA1EE (overwrite slot)
 extern "C" void __cdecl Hook_ShrineSave_Callback(int res, const char* pathOut) {
     if (res == 0 && pathOut && pathOut[0]) {
-        strcpy_s(g_SlotPath, pathOut);
-        g_AutosaveValid = TRUE;
-        g_LastSavedChapter = *(BYTE*)ADDR_FIELD_CHAPTER;
-        FILE* f = fopen(g_SlotFile, "w");
-        if (f) { fprintf(f, "%s\n", g_SlotPath); fclose(f); }
-        Log("[Autosave] [NativeSave] Saved to slot '%s' (Chapter %u, Diff %u, Room 0x%04X, ChapTrans %u)\n",
-            g_SlotPath, *(BYTE*)ADDR_FIELD_CHAPTER, *(BYTE*)ADDR_FIELD_DIFFICULTY,
-            *(WORD*)ADDR_FIELD_SAVED_ROOM, *(BYTE*)ADDR_FIELD_CHAP_TRANS);
+        Log("[Autosave] [NativeSave] Manual save recorded: %s (Chapter %u, Diff %u, Room 0x%04X)\n",
+            pathOut, *(BYTE*)ADDR_FIELD_CHAPTER, *(BYTE*)ADDR_FIELD_DIFFICULTY,
+            *(WORD*)ADDR_FIELD_SAVED_ROOM);
+        // Queue an autosave into our dedicated Autosave slot so quicksave stays in sync,
+        // without overwriting g_SlotPath with the player's manual dragon shrine slot!
+        QueueSaveC(SRC_SHRINE);
     }
     // Cancel any pending pre-transition autosave so next chapter starts clean
     InterlockedExchange(&g_PendingSave, 0);
@@ -1646,7 +1778,7 @@ static void __declspec(naked) Hook_ShrineSaveOver_Stub() {
     }
 }
 
-// 4. Runs on every function return in the game (all threads); only acts on the game thread.
+// 3. Runs on every function return in the game (all threads); only acts on the game thread.
 // Original at 0x00379C29: 3B 0D D8 CC 41 00 (cmp ecx, dword ptr [0x0041CCD8])
 static void __declspec(naked) Hook_Pump_Stub() {
     __asm {
@@ -1661,7 +1793,7 @@ static void __declspec(naked) Hook_Pump_Stub() {
     }
 }
 
-// 5. Intercepts State 9 Case 3/4 checkpoint load at 0x0016656A (5 bytes replaced)
+// 4. Intercepts State 9 Case 3/4 checkpoint load at 0x0016656A (5 bytes replaced)
 // Original: E8 11 51 00 00 (call 0x0016B680)
 static void __declspec(naked) Hook_Case3_Load_Stub() {
     __asm {
@@ -1672,7 +1804,7 @@ static void __declspec(naked) Hook_Case3_Load_Stub() {
     }
 }
 
-// 6. Intercepts Game Over loop tick at 0x002E08EA (5 bytes replaced)
+// 5. Intercepts Game Over loop tick at 0x002E08EA (5 bytes replaced)
 // Original: E8 01 1E F2 FF (call 0x2026f0)
 static void __declspec(naked) Hook_GameOver_Tick_Stub() {
     __asm {
@@ -1680,12 +1812,17 @@ static void __declspec(naked) Hook_GameOver_Tick_Stub() {
         call eax
 
         cmp g_PendingLoad, 1
-        je TriggerGameOverQuickLoad
+        jne CheckAutoloadPending
+        cmp g_AutosaveValid, 1
+        jne SkipQuickLoad
+        cmp byte ptr ds:[g_SlotPath], 0
+        je SkipQuickLoad
+        jmp TriggerGameOverQuickLoad
+
+    CheckAutoloadPending:
         cmp g_AutoloadPending, 1
         je TriggerGameOverQuickLoad
-
-        push 0x002E08EF
-        ret
+        jmp SkipQuickLoad
 
     TriggerGameOverQuickLoad:
         mov g_PendingLoad, 0
@@ -1700,6 +1837,81 @@ static void __declspec(naked) Hook_GameOver_Tick_Stub() {
         xor ebx, ebx
         mov dword ptr [esp + 0x18], 2
         push 0x002E0B87
+        ret
+
+    SkipQuickLoad:
+        push 0x002E08EF
+        ret
+    }
+}
+
+// 6a. Save game enumeration slot filter at 0x001DA26D (11 bytes replaced)
+// Filters out non-numbered saves (e.g. "Autosave") so the native Save Game and Load Game menus
+// only see and manage legitimate numbered slots (1..30), avoiding out-of-bounds corruption in 0x001DA500.
+// Original: E8 A5 46 19 00 83 C4 0C 8B D8 4B (call 0x36e917; add esp, 0xc; mov ebx, eax; dec ebx)
+static void __declspec(naked) Hook_SaveEnum_Filter_Stub() {
+    __asm {
+        mov eax, 0x0036E917 // wcstol
+        call eax
+        add esp, 0x0C
+
+        // Check if 1 <= eax && eax <= 30
+        mov ecx, eax
+        dec ecx
+        cmp ecx, 30
+        jae skip_invalid_slot
+
+        // Valid slot (0 <= ecx < 30)
+        mov ebx, eax
+        dec ebx
+        push 0x001DA278
+        ret
+
+    skip_invalid_slot:
+        pop ebx
+        pop edi
+        pop esi
+        xor al, al
+        pop ebp
+        add esp, 8
+        ret 8
+    }
+}
+
+// 6b. Game Over Continue hook at 0x002E0C9F (7 bytes replaced)
+// If a valid quicksave exists, player confirming "Yes" (Continue) recovers directly from the quicksave!
+// Original: 80 3D 8A A3 58 00 FF (cmp byte ptr [0x0058A38A], 0xFF)
+static void __declspec(naked) Hook_GameOver_Continue_Stub() {
+    __asm {
+        cmp g_AutosaveValid, 1
+        jne NormalContinueCheck
+        cmp byte ptr ds:[g_SlotPath], 0
+        je NormalContinueCheck
+
+        // Autosave is valid! Arm autoload and continue
+        mov g_AutoloadPending, 1
+        cmp byte ptr ds:[0x0058A38A], 0xFF
+        jne AutoSlotOk
+        mov byte ptr ds:[0x0058A38A], 0
+    AutoSlotOk:
+        mov eax, 0x002E15E0
+        call eax
+        mov bl, 1
+        push 0x002E0BB3
+        ret
+
+    NormalContinueCheck:
+        cmp byte ptr ds:[0x0058A38A], 0xFF
+        jne NormalContinueProceed
+        mov bl, 3
+        push 0x002E0BB3
+        ret
+
+    NormalContinueProceed:
+        mov eax, 0x002E15E0
+        call eax
+        mov bl, 1
+        push 0x002E0BB3
         ret
     }
 }
@@ -1787,16 +1999,18 @@ static BOOL BytesMatch(DWORD addr, const BYTE* expect, int n) {
 
 // Only patch once the XBE code at the hook sites is really mapped and unmodified
 static BOOL HookSitesReady() {
-    static const BYTE door[7]      = { 0x66, 0x89, 0x1D, 0xC2, 0x9A, 0xDB, 0x00 };
-    static const BYTE item[6]      = { 0x51, 0x55, 0x56, 0x83, 0xCA, 0xFF };
-    static const BYTE shrine[1]    = { 0xE8 };
-    static const BYTE cookie[6]    = { 0x3B, 0x0D, 0xD8, 0xCC, 0x41, 0x00 };
-    static const BYTE case3[5]     = { 0xE8, 0x11, 0x51, 0x00, 0x00 };
-    static const BYTE gameOver[5]  = { 0xE8, 0x01, 0x1E, 0xF2, 0xFF };
-    static const BYTE spirit[7]    = { 0x66, 0x89, 0x82, 0xCC, 0x01, 0x00, 0x00 };
-    static const BYTE unpack[7]    = { 0x66, 0x89, 0x0D, 0x6C, 0xA5, 0x58, 0x00 };
+    static const BYTE door[7]       = { 0x66, 0x89, 0x1D, 0xC2, 0x9A, 0xDB, 0x00 };
+    static const BYTE saveEnum[5]   = { 0xE8, 0xA5, 0x46, 0x19, 0x00 };
+    static const BYTE goContinue[7] = { 0x80, 0x3D, 0x8A, 0xA3, 0x58, 0x00, 0xFF };
+    static const BYTE shrine[1]     = { 0xE8 };
+    static const BYTE cookie[6]     = { 0x3B, 0x0D, 0xD8, 0xCC, 0x41, 0x00 };
+    static const BYTE case3[5]      = { 0xE8, 0x11, 0x51, 0x00, 0x00 };
+    static const BYTE gameOver[5]   = { 0xE8, 0x01, 0x1E, 0xF2, 0xFF };
+    static const BYTE spirit[7]     = { 0x66, 0x89, 0x82, 0xCC, 0x01, 0x00, 0x00 };
+    static const BYTE unpack[7]     = { 0x66, 0x89, 0x0D, 0x6C, 0xA5, 0x58, 0x00 };
     return BytesMatch(ADDR_HOOK_DOOR, door, 7) &&
-           BytesMatch(ADDR_HOOK_ITEM, item, 6) &&
+           BytesMatch(ADDR_HOOK_SAVE_ENUM, saveEnum, 5) &&
+           BytesMatch(ADDR_HOOK_GAMEOVER_CONTINUE, goContinue, 7) &&
            BytesMatch(ADDR_HOOK_SHRINE_NEW, shrine, 1) &&
            BytesMatch(ADDR_HOOK_SHRINE_OVER, shrine, 1) &&
            BytesMatch(ADDR_COOKIE_CHECK, cookie, 6) &&
@@ -1804,11 +2018,6 @@ static BOOL HookSitesReady() {
            BytesMatch(ADDR_HOOK_GAMEOVER_TICK, gameOver, 5) &&
            BytesMatch(ADDR_HOOK_USE_SPIRIT, spirit, 7) &&
            BytesMatch(ADDR_HOOK_UNPACK_KI, unpack, 7);
-}
-
-static BOOL IsMapped(DWORD addr) {
-    MEMORY_BASIC_INFORMATION mbi;
-    return VirtualQuery((void*)addr, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT;
 }
 
 static void PatchJump5(DWORD siteAddr, void* stubFn) {
@@ -1835,14 +2044,14 @@ void InstallHooks() {
     VirtualProtect((void*)ADDR_HOOK_DOOR, 16, oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_HOOK_DOOR, 16);
 
-    // 2. Inventory item acquisition / Chest & Safe reward (0x00154300), 6 bytes replaced (5-byte jmp + 1 NOP)
-    VirtualProtect((void*)ADDR_HOOK_ITEM, 16, PAGE_EXECUTE_READWRITE, &oldProtect);
-    BYTE jmpItem[6] = { 0xE9, 0, 0, 0, 0, 0x90 };
-    DWORD relItem = (DWORD)Hook_ItemGet_Stub - (ADDR_HOOK_ITEM + 5);
-    memcpy(&jmpItem[1], &relItem, 4);
-    memcpy((void*)ADDR_HOOK_ITEM, jmpItem, 6);
-    VirtualProtect((void*)ADDR_HOOK_ITEM, 16, oldProtect, &oldProtect);
-    FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_HOOK_ITEM, 16);
+    // 2. Save game enumeration slot filter (0x001DA26D), 11 bytes replaced (5-byte jmp + 6 NOPs)
+    VirtualProtect((void*)ADDR_HOOK_SAVE_ENUM, 16, PAGE_EXECUTE_READWRITE, &oldProtect);
+    BYTE jmpEnum[11] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    DWORD relEnum = (DWORD)Hook_SaveEnum_Filter_Stub - (ADDR_HOOK_SAVE_ENUM + 5);
+    memcpy(&jmpEnum[1], &relEnum, 4);
+    memcpy((void*)ADDR_HOOK_SAVE_ENUM, jmpEnum, 11);
+    VirtualProtect((void*)ADDR_HOOK_SAVE_ENUM, 16, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_HOOK_SAVE_ENUM, 16);
 
     // 3a & 3b. Shrine / Chapter Clear save: BOTH new-slot (0x001DA15F) and overwrite-slot (0x001DA1EE)
     PatchJump5(ADDR_HOOK_SHRINE_NEW,  (void*)Hook_ShrineSaveNew_Stub);
@@ -1874,8 +2083,17 @@ void InstallHooks() {
     VirtualProtect((void*)ADDR_HOOK_CASE3_LOAD, 8, oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_HOOK_CASE3_LOAD, 8);
 
-    // 6. Game Over loop tick (0x002E08EA), 5-byte jump
+    // 6a. Game Over loop tick (0x002E08EA), 5-byte jump
     PatchJump5(ADDR_HOOK_GAMEOVER_TICK, (void*)Hook_GameOver_Tick_Stub);
+
+    // 6b. Game Over Continue hook (0x002E0C9F), 7 bytes replaced (5-byte jmp + 2 NOPs)
+    VirtualProtect((void*)ADDR_HOOK_GAMEOVER_CONTINUE, 16, PAGE_EXECUTE_READWRITE, &oldProtect);
+    BYTE jmpGOC[7] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90 };
+    DWORD relGOC = (DWORD)Hook_GameOver_Continue_Stub - (ADDR_HOOK_GAMEOVER_CONTINUE + 5);
+    memcpy(&jmpGOC[1], &relGOC, 4);
+    memcpy((void*)ADDR_HOOK_GAMEOVER_CONTINUE, jmpGOC, 7);
+    VirtualProtect((void*)ADDR_HOOK_GAMEOVER_CONTINUE, 16, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_HOOK_GAMEOVER_CONTINUE, 16);
 
     // 7. Spirit of the Devils (0x001E23D6), 7 bytes replaced (5-byte call + 2 NOPs)
     VirtualProtect((void*)ADDR_HOOK_USE_SPIRIT, 16, PAGE_EXECUTE_READWRITE, &oldProtect);
@@ -1895,11 +2113,21 @@ void InstallHooks() {
     VirtualProtect((void*)ADDR_HOOK_UNPACK_KI, 16, oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_HOOK_UNPACK_KI, 16);
 
-    Log("[Autosave] [Verify] door=%02X item=%02X shrineNew=%02X shrineOver=%02X pump=%02X case3=%02X gameOver=%02X spirit=%02X unpack=%02X | PID=%u\n",
-        *(BYTE*)ADDR_HOOK_DOOR, *(BYTE*)ADDR_HOOK_ITEM,
+    // 9. Unlock all difficulties (Hard, Very Hard, Master Ninja) via 0x001DB598 jump table
+    VirtualProtect((void*)ADDR_UNLOCK_HARD, 12, PAGE_EXECUTE_READWRITE, &oldProtect);
+    *(DWORD*)ADDR_UNLOCK_HARD         = ADDR_UNLOCK_TARGET_FUNC;
+    *(DWORD*)ADDR_UNLOCK_VERY_HARD    = ADDR_UNLOCK_TARGET_FUNC;
+    *(DWORD*)ADDR_UNLOCK_MASTER_NINJA = ADDR_UNLOCK_TARGET_FUNC;
+    VirtualProtect((void*)ADDR_UNLOCK_HARD, 12, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_UNLOCK_HARD, 12);
+
+    Log("[Autosave] [Verify] door=%02X saveEnum=%02X goCont=%02X shrineNew=%02X shrineOver=%02X pump=%02X case3=%02X gameOver=%02X spirit=%02X unpack=%02X hardUnlock=%08X | PID=%u\n",
+        *(BYTE*)ADDR_HOOK_DOOR,
+        *(BYTE*)ADDR_HOOK_SAVE_ENUM, *(BYTE*)ADDR_HOOK_GAMEOVER_CONTINUE,
         *(BYTE*)ADDR_HOOK_SHRINE_NEW, *(BYTE*)ADDR_HOOK_SHRINE_OVER,
         *(BYTE*)ADDR_COOKIE_CHECK, *(BYTE*)ADDR_HOOK_CASE3_LOAD, *(BYTE*)ADDR_HOOK_GAMEOVER_TICK,
         *(BYTE*)ADDR_HOOK_USE_SPIRIT, *(BYTE*)ADDR_HOOK_UNPACK_KI,
+        *(DWORD*)ADDR_UNLOCK_HARD,
         GetCurrentProcessId());
     Log("[Autosave] All hooks successfully installed!\n");
 }
@@ -1928,8 +2156,8 @@ static BOOL DetectGameThread() {
 }
 
 static void LogHookStats() {
-    Log("[Autosave] [Stats] hooks fired: RoomEnter=%d ItemGet=%d ShrineSave=%d | gameTid=%u slotValid=%d pendingSave=%d pendingLoad=%d\n",
-        g_HookCount[SRC_ROOM], g_HookCount[SRC_ITEM], g_HookCount[SRC_SHRINE],
+    Log("[Autosave] [Stats] hooks fired: Door=%d ChapterStart=%d Encounter=%d ShrineSave=%d | gameTid=%u slotValid=%d pendingSave=%d pendingLoad=%d\n",
+        g_HookCount[SRC_DOOR], g_HookCount[SRC_CHAPTER_START], g_HookCount[SRC_ENEMY_ENCOUNTER], g_HookCount[SRC_SHRINE],
         g_GameTid, g_AutosaveValid, g_PendingSave, g_PendingLoad);
 }
 
@@ -1998,7 +2226,9 @@ DWORD WINAPI MainWorkerThread(LPVOID lpParam) {
     Log("[Autosave] Waiting for XBE mapping at 0x00010000...\n");
 
     for (;;) {
-        if (IsMapped(0x00010000) && IsMapped(ADDR_HOOK_DOOR) && IsMapped(ADDR_HOOK_ITEM) &&
+        if (IsMapped(0x00010000) && IsMapped(ADDR_HOOK_DOOR) &&
+            IsMapped(ADDR_HOOK_SAVE_ENUM) &&
+            IsMapped(ADDR_HOOK_GAMEOVER_CONTINUE) && IsMapped(ADDR_UNLOCK_HARD) &&
             IsMapped(ADDR_HOOK_SHRINE_NEW) && IsMapped(ADDR_HOOK_SHRINE_OVER) &&
             IsMapped(0x00379C28) && IsMapped(ADDR_HOOK_CASE3_LOAD) &&
             IsMapped(ADDR_HOOK_GAMEOVER_TICK) && IsMapped(ADDR_HOOK_USE_SPIRIT) &&
