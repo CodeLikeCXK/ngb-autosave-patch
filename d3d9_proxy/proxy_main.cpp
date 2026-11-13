@@ -1065,6 +1065,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDeviceEx(IDirect3D9Ex* d3d, UINT ada
 
 // Hook sites
 #define ADDR_HOOK_DOOR          0x002EF5CB   // Seamless door room update: mov [0xdb9ac2], bx (7 bytes)
+#define ADDR_HOOK_DOOR_INTERACT 0x002DF48F   // Stage interact trigger ([0x00D52CE8] != 0): movzx eax, byte ptr [0x00DB932E] (7 bytes)
 // ADDR_HOOK_ITEM (0x00154300) and ADDR_HOOK_SOBJ_INTERACT (0x002DF57F) removed per user requirement:
 // prevents undesirable autosaves during chests, levers, puzzles, or Chapter 6 chalice altar boss trigger.
 #define ADDR_HOOK_SAVE_ENUM     0x001DA26D   // Save enum slot filter in 0x001da220 (11 bytes)
@@ -1102,11 +1103,21 @@ static volatile DWORD g_LastLoadTick = 0;
 static volatile DWORD g_LastRoomSaveTick = 0;
 static volatile DWORD g_LastEncounterSaveTick = 0;
 static volatile DWORD g_ChapterStartTick = 0;
+static volatile DWORD g_DoorInteractTick = 0;
 static WORD g_LastRoomId = 0xFFFF;
 static BYTE g_CurrentChapter = 0xFF;
 static BYTE g_LastSavedChapter = 0xFF;
 static int g_LastEnemyCount = 0;
 static BOOL g_ChapterSavePending = FALSE;
+static volatile LONG g_PendingSaveSrc = 0;
+static BYTE  g_PreDoorImage[SIZE_SAVE_IMAGE];
+static BOOL  g_PreDoorImageValid = FALSE;
+static DWORD g_LastSnapshotTick = 0;
+static WORD  g_PreDoorRoom = 0xFFFF;
+static float g_PreDoorPos[3] = {0};
+static BYTE  g_PreDoorChapter = 0xFF;
+static BYTE  g_PreDoorDiff = 0;
+static WORD  g_PreDoorHP = 0;
 
 // Counts active spawned enemies with HP > 0 in actor slots 1..63 (slot 0 is player Ryu)
 static int GetActiveEnemyCount() {
@@ -1315,10 +1326,15 @@ static BOOL IsSafeToSaveNow(const char** outBlockReason = NULL) {
     if (*(BYTE*)ADDR_STATE_TRIGGER != 0) FAIL_SAVE("StateTrigger");
 
     if (*(BYTE*)ADDR_RYU_EVENT_LOCK != 0) FAIL_SAVE("RyuEventLock");
+    if ((*(DWORD*)0x00C0611C & 1) != 0) FAIL_SAVE("ScreenFadeActive");
 
     DWORD now = GetTickCount();
     if (now - g_ChapterStartTick < 2000) FAIL_SAVE("ChapterGracePeriod");
     if (now - g_LastLoadTick < 2000) FAIL_SAVE("QuickloadGracePeriod");
+    if (g_DoorInteractTick != 0) {
+        if (now - g_DoorInteractTick < 1500) FAIL_SAVE("DoorTransitionSettle");
+        g_DoorInteractTick = 0;
+    }
 
     WORD curRoom = *(WORD*)ADDR_CURRENT_ROOM;
     if (curRoom == 0x0200 || curRoom == 0xFFFF) FAIL_SAVE("InvalidRoom");
@@ -1330,58 +1346,93 @@ static BOOL IsSafeToSaveNow(const char** outBlockReason = NULL) {
     return TRUE;
 }
 
-// Packs Ryu's live world position, rotation matrix, HP, inventory, and room objects into 0x00572F40,
-// then writes the save buffer to disk via 0x0030F840. Must run on the game thread.
-static BOOL DoAutosave() {
+// Packs Ryu's live world position, rotation matrix, HP, inventory, and room objects into 0x00572F40.
+// If outBuf is non-NULL, copies the packed save image to outBuf and immediately restores live PACKED_VALID=0.
+static void PackLiveToBuffer(BYTE* outBuf, WORD* outRoom, float* outPos, BYTE* outChap, BYTE* outDiff, WORD* outHP, WORD* outBgm) {
+    WORD curRoom = *(WORD*)ADDR_CURRENT_ROOM;
+    WORD musicIdx = *(WORD*)0x005896EE;
+    // Track 0x1E is specifically the chapter clear / save screen BGM. Never record 0x1E in gameplay!
+    if (musicIdx == 0x1E || musicIdx >= 0x2F) {
+        WORD liveBgm = *(WORD*)ADDR_LIVE_BGM_TRACK;
+        if (liveBgm != 0x1E && liveBgm < 0x2F && liveBgm > 0) {
+            musicIdx = liveBgm;
+        } else {
+            musicIdx = 0; // 0 lets the game pick stage room BGM dynamically
+        }
+    }
+
+    // Pack live player state, room state, and global flags into ADDR_SAVE_IMAGE (0x00572F40)
+    // Mirrors 0x002FD540 without calling 0x002FD580 (which would open the interactive save UI).
+    __asm {
+        push ADDR_RYU_MATRIX
+        push ADDR_RYU_POS
+        movzx edx, musicIdx
+        mov eax, ADDR_FUNC_PACK_PLAYER
+        call eax
+        add esp, 8
+
+        mov ax, curRoom
+        mov ecx, ADDR_FUNC_PACK_ROOM
+        call ecx
+
+        mov eax, ADDR_FUNC_PACK_GLOBAL
+        call eax
+    }
+
+    // Ensure mid-stage packed flags are set in the buffer for when the save is LOADED
+    *(BYTE*)ADDR_FIELD_PACKED_VALID = 1;
+    *(BYTE*)ADDR_FIELD_CHAP_TRANS   = 0;
+    *(BYTE*)ADDR_FIELD_WIPE_FLAG    = 0;
+    *(BYTE*)ADDR_FIELD_STATE_MODE   = 1;
+
+    if (outChap) *outChap = *(BYTE*)ADDR_FIELD_CHAPTER;
+    if (outDiff) *outDiff = *(BYTE*)ADDR_FIELD_DIFFICULTY;
+    if (outRoom) *outRoom = *(WORD*)ADDR_FIELD_SAVED_ROOM;
+    if (outPos) {
+        outPos[0] = *(float*)(ADDR_RYU_POS + 0);
+        outPos[1] = *(float*)(ADDR_RYU_POS + 4);
+        outPos[2] = *(float*)(ADDR_RYU_POS + 8);
+    }
+    if (outHP)  *outHP  = *(WORD*)ADDR_RYU_HP;
+    if (outBgm) *outBgm = musicIdx;
+
+    if (outBuf) {
+        memcpy(outBuf, (void*)ADDR_SAVE_IMAGE, SIZE_SAVE_IMAGE);
+        // Live gameplay memory MUST keep PACKED_VALID = 0 so doors/cutscenes work!
+        *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
+        *(BYTE*)ADDR_BACKUP_PACKED_VAL  = 0;
+    }
+}
+
+// Writes either the pre-door snapshot (for SRC_DOOR) or live packed state to disk via 0x0030F840.
+static BOOL DoAutosave(int saveSrc) {
     __try {
         if (!IsSafeToSaveNow(NULL)) {
             return FALSE;
         }
 
-        WORD curRoom = *(WORD*)ADDR_CURRENT_ROOM;
-        WORD musicIdx = *(WORD*)0x005896EE;
-        // Track 0x1E is specifically the chapter clear / save screen BGM. Never record 0x1E in gameplay!
-        if (musicIdx == 0x1E || musicIdx >= 0x2F) {
-            WORD liveBgm = *(WORD*)ADDR_LIVE_BGM_TRACK;
-            if (liveBgm != 0x1E && liveBgm < 0x2F && liveBgm > 0) {
-                musicIdx = liveBgm;
-            } else {
-                musicIdx = 0; // 0 lets the game pick stage room BGM dynamically
-            }
+        BYTE chapter = 0, difficulty = 0;
+        WORD savedRoom = 0, hp = 0, musicIdx = 0;
+        float pos[3] = {0};
+        void* pSaveBuf = (void*)ADDR_SAVE_IMAGE;
+        BOOL usedPreDoor = (saveSrc == SRC_DOOR && g_PreDoorImageValid);
+
+        if (usedPreDoor) {
+            pSaveBuf   = (void*)g_PreDoorImage;
+            chapter    = g_PreDoorChapter;
+            difficulty = g_PreDoorDiff;
+            savedRoom  = g_PreDoorRoom;
+            pos[0]     = g_PreDoorPos[0];
+            pos[1]     = g_PreDoorPos[1];
+            pos[2]     = g_PreDoorPos[2];
+            hp         = g_PreDoorHP;
+            Log("[Autosave] Saving Pre-Door snapshot (Chapter %u, Diff %u, Room 0x%04X, Pos [%.1f, %.1f, %.1f], HP %u)...\n",
+                chapter, difficulty, savedRoom, pos[0], pos[1], pos[2], hp);
+        } else {
+            PackLiveToBuffer(NULL, &savedRoom, pos, &chapter, &difficulty, &hp, &musicIdx);
+            Log("[Autosave] Saving (Chapter %u, Diff %u, Room 0x%04X, Pos [%.1f, %.1f, %.1f], HP %u, BGM 0x%02X)...\n",
+                chapter, difficulty, savedRoom, pos[0], pos[1], pos[2], hp, musicIdx);
         }
-
-        // Pack live player state, room state, and global flags into ADDR_SAVE_IMAGE (0x00572F40)
-        // Mirrors 0x002FD540 without calling 0x002FD580 (which would open the interactive save UI).
-        __asm {
-            push ADDR_RYU_MATRIX
-            push ADDR_RYU_POS
-            movzx edx, musicIdx
-            mov eax, ADDR_FUNC_PACK_PLAYER
-            call eax
-            add esp, 8
-
-            mov ax, curRoom
-            mov ecx, ADDR_FUNC_PACK_ROOM
-            call ecx
-
-            mov eax, ADDR_FUNC_PACK_GLOBAL
-            call eax
-        }
-
-        // Ensure mid-stage packed flags are set in the buffer for when the save is LOADED
-        *(BYTE*)ADDR_FIELD_PACKED_VALID = 1;
-        *(BYTE*)ADDR_FIELD_CHAP_TRANS   = 0;
-        *(BYTE*)ADDR_FIELD_WIPE_FLAG    = 0;
-        *(BYTE*)ADDR_FIELD_STATE_MODE   = 1;
-
-        BYTE chapter = *(BYTE*)ADDR_FIELD_CHAPTER;
-        BYTE difficulty = *(BYTE*)ADDR_FIELD_DIFFICULTY;
-        WORD savedRoom = *(WORD*)ADDR_FIELD_SAVED_ROOM;
-        float px = *(float*)(ADDR_RYU_POS + 0);
-        float py = *(float*)(ADDR_RYU_POS + 4);
-        float pz = *(float*)(ADDR_RYU_POS + 8);
-        Log("[Autosave] Saving (Chapter %u, Diff %u, Room 0x%04X, Pos [%.1f, %.1f, %.1f], HP %u, BGM 0x%02X)...\n",
-            chapter, difficulty, savedRoom, px, py, pz, *(WORD*)ADDR_RYU_HP, musicIdx);
 
         char pathOut[0x104];
         memset(pathOut, 0, sizeof(pathOut));
@@ -1392,7 +1443,7 @@ static BOOL DoAutosave() {
             push 0
             push 0
             push SIZE_SAVE_IMAGE
-            push ADDR_SAVE_IMAGE
+            push pSaveBuf
             push name
             xor ecx, ecx
             lea edx, pathOut
@@ -1469,10 +1520,15 @@ extern "C" int __cdecl Hook_CheckpointLoad_Impl(int slotIdx) {
             WORD* pSaveMaxKi = (WORD*)ADDR_SAVE_MAX_KI;
             WORD* pSaveCurKi = (WORD*)ADDR_SAVE_CUR_KI;
             WORD* pSaveNinpo = (WORD*)ADDR_SAVE_EQUIP_NINPO;
-            if (*pSaveNinpo != 0 && *pSaveNinpo != 0xFFFF && *pSaveMaxKi < 200) {
-                *pSaveMaxKi = 400;
-                *pSaveCurKi = 400;
-                Log("[Autosave] [LoadImage] Repaired zeroed MaxKi/CurKi in save buffer -> 400\n");
+            if (*pSaveNinpo != 0 && *pSaveNinpo != 0xFFFF) {
+                if (*pSaveMaxKi < 200) {
+                    *pSaveMaxKi = 400;
+                    *pSaveCurKi = 400;
+                    Log("[Autosave] [LoadImage] Repaired zeroed MaxKi/CurKi in save buffer -> 400\n");
+                } else if (*pSaveCurKi < 200) {
+                    *pSaveCurKi = *pSaveMaxKi;
+                    Log("[Autosave] [LoadImage] Repaired zeroed CurKi in save buffer -> %u\n", *pSaveCurKi);
+                }
             }
 
             memcpy((void*)ADDR_CHECKPOINT_BACKUP, (void*)ADDR_SAVE_IMAGE, SIZE_SAVE_IMAGE);
@@ -1484,6 +1540,7 @@ extern "C" int __cdecl Hook_CheckpointLoad_Impl(int slotIdx) {
             g_LastLoadTick    = GetTickCount();
             g_LastRoomId      = savedRoom;
             g_CurrentChapter  = loadedChapter;
+            g_PreDoorImageValid = FALSE;
             g_AutoloadPending = 0;
 
             Log("[Autosave] Autoload successful (Chapter %u, Room 0x%04X, Spawn 0x%04X, Packed %u) -> resuming via State 9 -> State 5\n",
@@ -1526,6 +1583,7 @@ extern "C" void __cdecl QueueSaveC(int src) {
     LONG n = InterlockedIncrement(&g_HookCount[hookIdx]);
     Log("[Autosave] [Hook:%s] fired #%d on thread %u -> queue save\n",
         hookTag, n, tid);
+    InterlockedExchange(&g_PendingSaveSrc, src);
     InterlockedExchange(&g_PendingSave, 1);
 }
 
@@ -1561,6 +1619,8 @@ extern "C" void __cdecl PumpC() {
         g_LastRoomId = 0xFFFF;
         g_ChapterSavePending = FALSE;
         g_LastEnemyCount = 0;
+        g_DoorInteractTick = 0;
+        g_PreDoorImageValid = FALSE;
     }
 
     // CRITICAL FIX FOR HAN'S BAR / CUTSCENE DOORS:
@@ -1647,7 +1707,20 @@ extern "C" void __cdecl PumpC() {
             *(WORD*)ADDR_SAVE_MAX_KI = 400;
             *(WORD*)ADDR_SAVE_CUR_KI = 400;
             Log("[Autosave] [KiGuard] Auto-recovered zeroed MaxKi/CurKi -> 400 (Ninpo: 0x%04X, 2 slots)\n", curEquipNinpo);
+            InterlockedExchange(&g_PendingSaveSrc, 0);
             InterlockedExchange(&g_PendingSave, 1);
+        }
+
+        // 5. Rolling Pre-Door Snapshot: keep a recent safe in-RAM state (~350ms cadence)
+        // so that when a door is opened, SRC_DOOR saves the player's position & state
+        // cleanly IN FRONT of the door (before stepping into enemies or mid-transition seams).
+        if (g_PendingSave == 0 && g_PendingLoad == 0 && g_DoorInteractTick == 0 &&
+            *(volatile DWORD*)ADDR_SAVE_POOL == 0 &&
+            (now - g_LastSnapshotTick >= 350) && IsSafeToSaveNow(NULL)) {
+            PackLiveToBuffer(g_PreDoorImage, &g_PreDoorRoom, g_PreDoorPos,
+                             &g_PreDoorChapter, &g_PreDoorDiff, &g_PreDoorHP, NULL);
+            g_PreDoorImageValid = TRUE;
+            g_LastSnapshotTick = now;
         }
     }
 
@@ -1696,7 +1769,8 @@ extern "C" void __cdecl PumpC() {
         const char* blockWhy = NULL;
         if (IsSafeToSaveNow(&blockWhy)) {
             if (InterlockedCompareExchange(&g_PendingSave, 0, 1) == 1) {
-                DoAutosave();
+                int saveSrc = (int)InterlockedExchange(&g_PendingSaveSrc, 0);
+                DoAutosave(saveSrc);
             }
         } else if ((LONG)now - g_SaveWaitLogTick > 3000) {
             g_SaveWaitLogTick = (LONG)now;
@@ -1725,6 +1799,45 @@ static void __declspec(naked) Hook_DoorEnter_Stub() {
         popad
     SkipDoorSave:
         push 0x002EF5D2
+        ret
+    }
+}
+
+extern "C" void __cdecl OnDoorInteractCheckC(const DWORD* act) {
+    if (!act) return;
+    if (*(BYTE*)0x0058A389 != 0) return; // suppress during cutscene / movie
+    __try {
+        // Match door-transition scripts whose initial action is ScreenFade (0x820000B6, 0x1E frames).
+        // Excludes chests (0x8200005B/0x82000083), Dragon Statues (0x82000123),
+        // Muramasa Shop (0x82000122), examine dialogs (0x82000111), and Ch6 chalice altar (0x82000115).
+        BOOL isDoorFade =
+            (act[0] == 0 && act[1] == 0x82000057 && act[2] == 0 &&
+             act[3] == 0x820000B6 && act[4] == 0x0000001E) ||
+            (act[0] == 0x82000057 && act[1] == 0 &&
+             act[2] == 0x820000B6 && act[3] == 0x0000001E);
+        if (isDoorFade) {
+            Log("[Autosave] Door interact trigger detected (act=%p, fade=0x1E)\n", act);
+            g_DoorInteractTick = GetTickCount();
+            QueueSaveC(SRC_DOOR);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// 1b. Stage button-press interact trigger at 0x002DF48F (7 bytes replaced)
+// Original: 0F B6 05 2E 93 DB 00 (movzx eax, byte ptr ds:[0x00DB932E])
+static void __declspec(naked) Hook_DoorInteract_Stub() {
+    __asm {
+        pushad
+        pushfd
+        mov eax, dword ptr [esi + 8]
+        push eax
+        call OnDoorInteractCheckC
+        add esp, 4
+        popfd
+        popad
+        movzx eax, byte ptr ds:[0x00DB932E]
+        push 0x002DF496
         ret
     }
 }
@@ -1958,8 +2071,10 @@ static void __declspec(naked) Hook_UseSpirit_Stub() {
 extern "C" void __cdecl Hook_UnpackStats_Callback(WORD liveEquipNinpo, WORD saveMaxKi) {
     WORD maxKi = saveMaxKi;
     WORD curKi = *(WORD*)ADDR_RYU_CUR_KI;
+    Log("[Autosave] [UnpackHook] Stats unpacked: MaxKi=%u, CurKi=%u, EquipNinpo=0x%04X\n",
+        maxKi, curKi, liveEquipNinpo);
 
-    // If player has Ninpo equipped/unlocked, but MaxKi was zeroed, repair it immediately!
+    // If player has Ninpo equipped/unlocked, but MaxKi or CurKi was zeroed, repair it immediately!
     if (liveEquipNinpo != 0 && liveEquipNinpo != 0xFFFF) {
         if (maxKi < 200) {
             maxKi = 400; // 2 slots
@@ -1968,6 +2083,12 @@ extern "C" void __cdecl Hook_UnpackStats_Callback(WORD liveEquipNinpo, WORD save
             *(WORD*)ADDR_SAVE_CUR_KI = curKi;
             *(WORD*)ADDR_RYU_CUR_KI  = curKi;
             Log("[Autosave] [UnpackHook] Repaired zeroed stats -> MaxKi=400, CurKi=400 (Ninpo: 0x%04X)\n", liveEquipNinpo);
+        } else if (curKi < 200) {
+            curKi = maxKi;
+            *(WORD*)ADDR_SAVE_CUR_KI = curKi;
+            *(WORD*)ADDR_RYU_CUR_KI  = curKi;
+            Log("[Autosave] [UnpackHook] Repaired zeroed CurKi -> %u (MaxKi=%u, Ninpo: 0x%04X)\n",
+                curKi, maxKi, liveEquipNinpo);
         }
     }
     *(WORD*)ADDR_RYU_MAX_KI = maxKi;
@@ -2000,6 +2121,7 @@ static BOOL BytesMatch(DWORD addr, const BYTE* expect, int n) {
 // Only patch once the XBE code at the hook sites is really mapped and unmodified
 static BOOL HookSitesReady() {
     static const BYTE door[7]       = { 0x66, 0x89, 0x1D, 0xC2, 0x9A, 0xDB, 0x00 };
+    static const BYTE doorInt[7]    = { 0x0F, 0xB6, 0x05, 0x2E, 0x93, 0xDB, 0x00 };
     static const BYTE saveEnum[5]   = { 0xE8, 0xA5, 0x46, 0x19, 0x00 };
     static const BYTE goContinue[7] = { 0x80, 0x3D, 0x8A, 0xA3, 0x58, 0x00, 0xFF };
     static const BYTE shrine[1]     = { 0xE8 };
@@ -2009,6 +2131,7 @@ static BOOL HookSitesReady() {
     static const BYTE spirit[7]     = { 0x66, 0x89, 0x82, 0xCC, 0x01, 0x00, 0x00 };
     static const BYTE unpack[7]     = { 0x66, 0x89, 0x0D, 0x6C, 0xA5, 0x58, 0x00 };
     return BytesMatch(ADDR_HOOK_DOOR, door, 7) &&
+           BytesMatch(ADDR_HOOK_DOOR_INTERACT, doorInt, 7) &&
            BytesMatch(ADDR_HOOK_SAVE_ENUM, saveEnum, 5) &&
            BytesMatch(ADDR_HOOK_GAMEOVER_CONTINUE, goContinue, 7) &&
            BytesMatch(ADDR_HOOK_SHRINE_NEW, shrine, 1) &&
@@ -2043,6 +2166,15 @@ void InstallHooks() {
     memcpy((void*)ADDR_HOOK_DOOR, jmpDoor, 7);
     VirtualProtect((void*)ADDR_HOOK_DOOR, 16, oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_HOOK_DOOR, 16);
+
+    // 1b. Stage door-interact trigger (0x002DF48F), 7 bytes replaced (5-byte jmp + 2 NOPs)
+    VirtualProtect((void*)ADDR_HOOK_DOOR_INTERACT, 16, PAGE_EXECUTE_READWRITE, &oldProtect);
+    BYTE jmpDoorInt[7] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90 };
+    DWORD relDoorInt = (DWORD)Hook_DoorInteract_Stub - (ADDR_HOOK_DOOR_INTERACT + 5);
+    memcpy(&jmpDoorInt[1], &relDoorInt, 4);
+    memcpy((void*)ADDR_HOOK_DOOR_INTERACT, jmpDoorInt, 7);
+    VirtualProtect((void*)ADDR_HOOK_DOOR_INTERACT, 16, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_HOOK_DOOR_INTERACT, 16);
 
     // 2. Save game enumeration slot filter (0x001DA26D), 11 bytes replaced (5-byte jmp + 6 NOPs)
     VirtualProtect((void*)ADDR_HOOK_SAVE_ENUM, 16, PAGE_EXECUTE_READWRITE, &oldProtect);
@@ -2227,6 +2359,7 @@ DWORD WINAPI MainWorkerThread(LPVOID lpParam) {
 
     for (;;) {
         if (IsMapped(0x00010000) && IsMapped(ADDR_HOOK_DOOR) &&
+            IsMapped(ADDR_HOOK_DOOR_INTERACT) &&
             IsMapped(ADDR_HOOK_SAVE_ENUM) &&
             IsMapped(ADDR_HOOK_GAMEOVER_CONTINUE) && IsMapped(ADDR_UNLOCK_HARD) &&
             IsMapped(ADDR_HOOK_SHRINE_NEW) && IsMapped(ADDR_HOOK_SHRINE_OVER) &&
@@ -2281,6 +2414,7 @@ DWORD WINAPI MainWorkerThread(LPVOID lpParam) {
                     padSave ? "Pad:Back+LB" : "F5", *(BYTE*)ADDR_LIVE_CHAPTER, g_GameTid);
                 LogHookStats();
                 if (DetectGameThread()) {
+                    InterlockedExchange(&g_PendingSaveSrc, 0);
                     InterlockedExchange(&g_PendingSave, 1);
                 } else {
                     Log("[Autosave] Manual save ignored: game thread unknown\n");
