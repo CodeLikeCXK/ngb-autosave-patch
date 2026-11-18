@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <intrin.h>
+#include <math.h>
 
 // Exports are declared via linker pragmas (no .def) so exported symbol names are exact.
 #pragma comment(linker, "/EXPORT:Direct3DCreate9=_Proxy_Direct3DCreate9@4")
@@ -1122,6 +1123,19 @@ static BYTE  g_PreDoorChapter = 0xFF;
 static BYTE  g_PreDoorDiff = 0;
 static WORD  g_PreDoorHP = 0;
 
+// Previous full rolling snapshot (~350ms earlier). The door hook fires after
+// the trigger state has already become 1, so the current rolling image can be
+// from the activation/approach. The previous image is the closest snapshot
+// that still has the door idle; use it as the true pre-trigger checkpoint.
+static BYTE  g_PrevPreDoorImage[SIZE_SAVE_IMAGE];
+static BOOL  g_PrevPreDoorImageValid = FALSE;
+static DWORD g_PrevPreDoorTick = 0;
+static WORD  g_PrevPreDoorRoom = 0xFFFF;
+static float g_PrevPreDoorPos[3] = {0};
+static BYTE  g_PrevPreDoorChapter = 0xFF;
+static BYTE  g_PrevPreDoorDiff = 0;
+static WORD  g_PrevPreDoorHP = 0;
+
 // Frozen door-sequence snapshot: copied from g_PreDoorImage when a door
 // interaction starts. SRC_DOOR saves always write this image, never the live
 // state, so subsequent room-change events cannot overwrite the pre-door
@@ -1138,9 +1152,15 @@ static DWORD g_DoorSaveCapturedTick = 0;
 static volatile BOOL  g_DoorSeqActive = FALSE;
 static volatile DWORD g_DoorSeqTick = 0;
 static const BYTE*    g_DoorSeqTrig = NULL;
-static volatile BOOL  g_DoorSaveFlushPending = FALSE;
 static BOOL           g_DoorSaveWritten = FALSE;
 static volatile LONG  g_InSnapshot = 0;
+// One-shot reset applied on the first active gameplay frame after a load, so
+// the room-unpack pass cannot restore a stale "door already active" state.
+static const BYTE*    g_PostLoadDoorTrig = NULL;
+static WORD           g_PostLoadDoorRoom = 0xFFFF;
+static volatile BOOL  g_PostLoadDoorResetPending = FALSE;
+static volatile DWORD g_PostLoadDoorResetRoomTick = 0;
+static volatile BOOL  g_PostLoadDoorCheckDone = TRUE;
 
 // Counts active spawned enemies with HP > 0 in actor slots 1..63 (slot 0 is player Ryu)
 static int GetActiveEnemyCount() {
@@ -1332,7 +1352,8 @@ static BOOL IsCutscenePlayingNow() {
 }
 
 // Checks if the game is currently in unpaused, active gameplay where packing & saving Ryu's state is safe.
-static BOOL IsSafeToSaveNow(const char** outBlockReason = NULL, BOOL bypassGrace = FALSE) {
+static BOOL IsSafeToSaveNow(const char** outBlockReason = NULL, BOOL bypassGrace = FALSE,
+                            BOOL ignoreSobjRoomTransition = FALSE, BOOL ignoreInteractionLocks = FALSE) {
     #define FAIL_SAVE(why) do { if (outBlockReason) *outBlockReason = why; return FALSE; } while (0)
 
     BYTE gstate = *(BYTE*)ADDR_GLOBAL_STATE;
@@ -1345,11 +1366,13 @@ static BOOL IsSafeToSaveNow(const char** outBlockReason = NULL, BOOL bypassGrace
     if (*(BYTE*)ADDR_FIELD_STATE_MODE == 2) FAIL_SAVE("GameOverMode");
     if (IsCutscenePlayingNow()) FAIL_SAVE("CutsceneActive");
     if (*(BYTE*)ADDR_FIELD_CHAP_TRANS != 0) FAIL_SAVE("ChapTransActive");
-    if (*(BYTE*)ADDR_ROOM_TRANSITION != 0) FAIL_SAVE("RoomTransition");
+    if (!ignoreSobjRoomTransition && *(BYTE*)ADDR_ROOM_TRANSITION != 0) FAIL_SAVE("RoomTransition");
     if (*(BYTE*)ADDR_STATE_TRIGGER != 0) FAIL_SAVE("StateTrigger");
 
-    if (*(BYTE*)ADDR_RYU_EVENT_LOCK != 0) FAIL_SAVE("RyuEventLock");
-    if ((*(DWORD*)0x00C0611C & 1) != 0) FAIL_SAVE("ScreenFadeActive");
+    if (!ignoreInteractionLocks) {
+        if (*(BYTE*)ADDR_RYU_EVENT_LOCK != 0) FAIL_SAVE("RyuEventLock");
+        if ((*(DWORD*)0x00C0611C & 1) != 0) FAIL_SAVE("ScreenFadeActive");
+    }
 
     if (!bypassGrace) {
         DWORD now = GetTickCount();
@@ -1388,7 +1411,9 @@ static void PackLiveToBuffer(BYTE* outBuf, WORD* outRoom, float* outPos, BYTE* o
 
     // Pack live player state, room state, and global flags into ADDR_SAVE_IMAGE (0x00572F40)
     // Mirrors 0x002FD540 without calling 0x002FD580 (which would open the interactive save UI).
+    // 0x002F1820 (PACK_GLOBAL) reads curRoom from SI via 0x002FCA30, matching 0x002FD550.
     __asm {
+        push esi
         push ADDR_RYU_MATRIX
         push ADDR_RYU_POS
         movzx edx, musicIdx
@@ -1396,12 +1421,14 @@ static void PackLiveToBuffer(BYTE* outBuf, WORD* outRoom, float* outPos, BYTE* o
         call eax
         add esp, 8
 
-        mov ax, curRoom
+        movzx esi, curRoom
+        mov eax, esi
         mov ecx, ADDR_FUNC_PACK_ROOM
         call ecx
 
         mov eax, ADDR_FUNC_PACK_GLOBAL
         call eax
+        pop esi
     }
 
     // Ensure mid-stage packed flags are set in the buffer for when the save is LOADED
@@ -1477,6 +1504,69 @@ static BOOL WriteSaveBufferToDisk(void* pSaveBuf, BYTE chapter) {
 static void ClearDoorSequence(const char* why);
 static void AbandonDoorSequence(const char* why);
 
+// Maps a game room ID to its 0-based packed room slot index via 0x002FCA30 (si = room),
+// matching PACK_ROOM (0x002F1780) and UNPACK_ROOM (0x002F1900).
+static WORD GetPackedRoomSlot(WORD room) {
+    if (room >= 0x0200) return 0x0200;
+    WORD slot = 0x0200;
+    __try {
+        if (*(DWORD*)0x00DB98C4 != 0) {
+            __asm {
+                push esi
+                movzx esi, room
+                mov eax, 0x002FCA30
+                call eax
+                mov slot, ax
+                pop esi
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        slot = 0x0200;
+    }
+    return slot;
+}
+
+// PACK_ROOM serializes each SOBJ trigger's +0x24 state byte into the save
+// image's room block using the packed room slot index from 0x002FCA30.
+// Returns the byte offset of the current trigger's state in the image.
+static BOOL GetDoorTriggerImageOffset(const BYTE* trig, WORD room, DWORD* outOff) {
+    if (!trig || !outOff) return FALSE;
+    DWORD addr = (DWORD)trig;
+    if (addr < 0xD53320) return FALSE;
+    DWORD delta = addr - 0xD53320;
+    if ((delta % 0x68) != 0) return FALSE;
+    DWORD n = delta / 0x68;
+    if (n >= 0x380) return FALSE;
+    WORD slot = GetPackedRoomSlot(room);
+    if (slot >= 0x0200) return FALSE; // PACK_ROOM skips invalid/unmapped rooms
+
+    // Room state block: VA 0x572F90 + slot*0x790, state bytes at +0x410.
+    // The image starts at VA 0x572F40, so offset = 0x50 + 0x410 + slot*0x790 + n.
+    DWORD off = 0x00000460 + (DWORD)slot * 0x790 + n;
+    if (off >= SIZE_SAVE_IMAGE) return FALSE;
+    *outOff = off;
+    return TRUE;
+}
+
+// Restores an in-progress (2) or mistakenly exhausted (3 when live was 1) door
+// state back to idle/armed (1) in the frozen image. Never patch to 3: in
+// DoorInteract_2DF3C0 (0x002DF3E3: cmp al,1; jne 0x2df4a0), state 3 skips
+// ConditionEval completely and permanently deadlocks reusable doors.
+static void ResetSavedDoorTriggerState(const BYTE* trig, WORD room, BYTE liveState) {
+    DWORD off = 0;
+    if (!GetDoorTriggerImageOffset(trig, room, &off)) {
+        Log("[Autosave] [DoorSeq] Trigger state patch skipped (trig=%p, room=0x%04X)\n", trig, room);
+        return;
+    }
+
+    BYTE old = g_DoorSaveImage[off];
+    BYTE patched = old;
+    if (old == 2 || (old == 3 && liveState == 1)) patched = 1;
+    g_DoorSaveImage[off] = patched;
+    Log("[Autosave] [DoorSeq] Saved trigger state (trig=%p, room=0x%04X, off=0x%X): 0x%02X -> 0x%02X (live=0x%02X)\n",
+        trig, room, off, old, patched, liveState);
+}
+
 static BOOL CaptureDoorSequenceSnapshot(const BYTE* trig) {
     DWORD now = GetTickCount();
 
@@ -1484,37 +1574,57 @@ static BOOL CaptureDoorSequenceSnapshot(const BYTE* trig) {
     AbandonDoorSequence("new door capture");
 
     DWORD age = (g_LastSnapshotTick != 0) ? (now - g_LastSnapshotTick) : 0xFFFFFFFF;
-    BOOL usedLiveFallback = FALSE;
-
     BYTE liveChapter = *(BYTE*)ADDR_LIVE_CHAPTER;
+    WORD liveRoom = *(WORD*)ADDR_CURRENT_ROOM;
+
     BOOL chapterMismatch = (g_PreDoorImageValid && g_PreDoorChapter != liveChapter);
+    BOOL roomMismatch = (g_PreDoorImageValid && g_PreDoorRoom != liveRoom);
 
     float dx = *(float*)(ADDR_RYU_POS + 0) - g_PreDoorPos[0];
     float dy = *(float*)(ADDR_RYU_POS + 4) - g_PreDoorPos[1];
     float dz = *(float*)(ADDR_RYU_POS + 8) - g_PreDoorPos[2];
-    // Reject an old-room snapshot if the player has moved far away from it.
     BOOL positionTooFar = (g_PreDoorImageValid && (dx * dx + dy * dy + dz * dz) > (20.0f * 20.0f));
+    BOOL currentUsable = g_PreDoorImageValid && age <= 2000 && !chapterMismatch && !roomMismatch && !positionTooFar;
 
-    if (!g_PreDoorImageValid || age > 2000 || chapterMismatch || positionTooFar) {
-        if (!IsInActiveGameplayFrame()) {
-            Log("[Autosave] [DoorSeq] No recent rolling snapshot and not in active gameplay; capture skipped\n");
-            return FALSE;
-        }
-        Log("[Autosave] [DoorSeq] Rolling snapshot unusable (valid=%d age=%ums chapterMismatch=%d positionTooFar=%d); packing live fallback\n",
-            g_PreDoorImageValid, age, chapterMismatch, positionTooFar);
-        InterlockedExchange(&g_InSnapshot, 1);
-        __try {
-            PackLiveToBuffer(g_DoorSaveImage, &g_DoorSaveRoom, g_DoorSavePos,
-                             &g_DoorSaveChapter, &g_DoorSaveDiff, &g_DoorSaveHP, NULL);
-            usedLiveFallback = TRUE;
-        } __except (ExcFilter(GetExceptionInformation(), "CaptureDoorSequenceSnapshot")) {
-            *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
-            *(BYTE*)ADDR_BACKUP_PACKED_VAL  = 0;
-            InterlockedExchange(&g_InSnapshot, 0);
-            return FALSE;
-        }
-        InterlockedExchange(&g_InSnapshot, 0);
-    } else {
+    // The door hook fires after [trig+0x24] has already become 1. If the current
+    // rolling image already has this door active (1/2), use the previous full
+    // image: it is the closest snapshot that still has the door idle and the
+    // player outside the doorway. This is the practical "save before trigger".
+    BYTE curState = 0xFF, prevState = 0xFF;
+    DWORD stateOff = 0;
+    if (currentUsable && GetDoorTriggerImageOffset(trig, g_PreDoorRoom, &stateOff)) {
+        curState = g_PreDoorImage[stateOff];
+    }
+
+    BOOL prevRoomMatches = g_PrevPreDoorImageValid && g_PrevPreDoorRoom == liveRoom;
+    BOOL prevChapterMatches = (g_PrevPreDoorChapter == liveChapter);
+    float pdx = *(float*)(ADDR_RYU_POS + 0) - g_PrevPreDoorPos[0];
+    float pdy = *(float*)(ADDR_RYU_POS + 4) - g_PrevPreDoorPos[1];
+    float pdz = *(float*)(ADDR_RYU_POS + 8) - g_PrevPreDoorPos[2];
+    BOOL prevPosTooFar = (pdx * pdx + pdy * pdy + pdz * pdz) > (20.0f * 20.0f);
+    BOOL prevRecent = prevRoomMatches && prevChapterMatches && !prevPosTooFar &&
+                      (DWORD)(now - g_PrevPreDoorTick) <= 3000;
+    if (prevRoomMatches && GetDoorTriggerImageOffset(trig, g_PrevPreDoorRoom, &stateOff)) {
+        prevState = g_PrevPreDoorImage[stateOff];
+    }
+
+    BOOL currentDoorActive = (curState == 1 || curState == 2);
+    BOOL prevStateKnown = (prevState != 0xFF);
+    BOOL prevDoorIdle = prevStateKnown && !(prevState == 1 || prevState == 2);
+    BOOL usePrev = prevRecent && prevDoorIdle && (!currentUsable || currentDoorActive);
+    const char* source = usePrev ? "previous" : (currentUsable ? "current" : "live");
+    BYTE chosenState = usePrev ? prevState : (currentUsable ? curState : 0xFF);
+
+    if (usePrev) {
+        memcpy(g_DoorSaveImage, g_PrevPreDoorImage, SIZE_SAVE_IMAGE);
+        g_DoorSaveRoom    = g_PrevPreDoorRoom;
+        g_DoorSavePos[0]  = g_PrevPreDoorPos[0];
+        g_DoorSavePos[1]  = g_PrevPreDoorPos[1];
+        g_DoorSavePos[2]  = g_PrevPreDoorPos[2];
+        g_DoorSaveChapter = g_PrevPreDoorChapter;
+        g_DoorSaveDiff    = g_PrevPreDoorDiff;
+        g_DoorSaveHP      = g_PrevPreDoorHP;
+    } else if (currentUsable) {
         memcpy(g_DoorSaveImage, g_PreDoorImage, SIZE_SAVE_IMAGE);
         g_DoorSaveRoom    = g_PreDoorRoom;
         g_DoorSavePos[0]  = g_PreDoorPos[0];
@@ -1523,7 +1633,76 @@ static BOOL CaptureDoorSequenceSnapshot(const BYTE* trig) {
         g_DoorSaveChapter = g_PreDoorChapter;
         g_DoorSaveDiff    = g_PreDoorDiff;
         g_DoorSaveHP      = g_PreDoorHP;
+    } else {
+        if (!IsInActiveGameplayFrame()) {
+            Log("[Autosave] [DoorSeq] No usable rolling snapshot and not in active gameplay; capture skipped\n");
+            return FALSE;
+        }
+        Log("[Autosave] [DoorSeq] No usable current/previous snapshot (cur=0x%02X prev=0x%02X); packing live fallback\n",
+            curState, prevState);
+        InterlockedExchange(&g_InSnapshot, 1);
+        __try {
+            PackLiveToBuffer(g_DoorSaveImage, &g_DoorSaveRoom, g_DoorSavePos,
+                             &g_DoorSaveChapter, &g_DoorSaveDiff, &g_DoorSaveHP, NULL);
+        } __except (ExcFilter(GetExceptionInformation(), "CaptureDoorSequenceSnapshot")) {
+            *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
+            *(BYTE*)ADDR_BACKUP_PACKED_VAL  = 0;
+            InterlockedExchange(&g_InSnapshot, 0);
+            return FALSE;
+        }
+        InterlockedExchange(&g_InSnapshot, 0);
     }
+
+    // Keep the checkpoint even when the door was already used (state 3) or is
+    // mid-activation (1/2). Skipping these saves loses the player's progress
+    // between the manual save and the door. The local trigger state byte is
+    // still patched to 0 below; the game re-arms used doors when A is pressed.
+    if (chosenState != 0) {
+        Log("[Autosave] [DoorSeq] Door state 0x%02X (source=%s, current=0x%02X, previous=0x%02X); saving checkpoint anyway\n",
+            chosenState, source, curState, prevState);
+
+        DWORD diagOff = 0;
+        if (GetDoorTriggerImageOffset(trig, g_DoorSaveRoom, &diagOff)) {
+            WORD diagSlot = GetPackedRoomSlot(g_DoorSaveRoom);
+            DWORD n = (diagSlot < 0x0200) ? (diagOff - 0x00000460 - (DWORD)diagSlot * 0x790) : 0;
+            Log("[Autosave] [DoorState] n=%u (slot=%u) image states:", n, (unsigned)diagSlot);
+            for (int d = -8; d <= 8; ++d) {
+                int idx = (int)n + d;
+                if (idx >= 0 && idx < 0x380) {
+                    BYTE b = g_DoorSaveImage[diagOff + d];
+                    if (b != 0) Log(" %d:0x%02X", idx, b);
+                }
+            }
+            Log("\n[Autosave] [DoorState] live states:");
+            for (int d = -8; d <= 8; ++d) {
+                int idx = (int)n + d;
+                if (idx >= 0 && idx < 0x380) {
+                    BYTE b = *(BYTE*)(0xD53344 + (DWORD)idx * 0x68);
+                    if (b != 0) Log(" %d:0x%02X", idx, b);
+                }
+            }
+            Log("\n");
+        }
+
+        const DWORD* act = *(const DWORD**)(trig + 8);
+        if (act) {
+            Log("[Autosave] [DoorState] act:");
+            for (int i = 0; i < 24; ++i) Log(" %08X", act[i]);
+            Log("\n");
+        }
+    }
+
+    // Convert an in-progress state (1/2) to finished (3) so loading cannot
+    // execute the action list automatically, while keeping it re-armable by the
+    // normal interaction scan. Fresh (0) and already-finished (3) states are
+    // preserved. No positional offset is applied.
+    BYTE liveTrigState = 0xFF;
+    __try {
+        liveTrigState = *(const BYTE*)(trig + 0x24);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        liveTrigState = 0xFF;
+    }
+    ResetSavedDoorTriggerState(trig, g_DoorSaveRoom, liveTrigState);
 
     g_DoorSaveValid        = TRUE;
     g_DoorSaveWritten      = FALSE;
@@ -1531,60 +1710,25 @@ static BOOL CaptureDoorSequenceSnapshot(const BYTE* trig) {
     g_DoorSeqActive        = TRUE;
     g_DoorSeqTick          = now;
     g_DoorSeqTrig          = trig;
-    g_DoorSaveFlushPending = TRUE;
 
-    Log("[Autosave] [DoorSeq] Frozen pre-door snapshot (%s, age=%ums, Chapter %u, Diff %u, Room 0x%04X, Pos [%.1f, %.1f, %.1f], HP %u)\n",
-        usedLiveFallback ? "live-fallback" : "rolling", age,
+    Log("[Autosave] [DoorSeq] Frozen pre-door snapshot (source=%s, currentState=0x%02X, prevState=0x%02X, age=%ums, Chapter %u, Diff %u, Room 0x%04X, Pos [%.1f, %.1f, %.1f], HP %u)\n",
+        source, curState, prevState, age,
         g_DoorSaveChapter, g_DoorSaveDiff, g_DoorSaveRoom,
         g_DoorSavePos[0], g_DoorSavePos[1], g_DoorSavePos[2], g_DoorSaveHP);
     return TRUE;
-}
-
-// Writes the frozen door-sequence image as early as possible (first PumpC call
-// after the trigger with the save pool free), so death or an immediate F9 still
-// has the pre-door state even if the room transition never reaches a "safe"
-// state for a normal deferred save.
-static BOOL FlushDoorSaveNow() {
-    if (!g_DoorSaveFlushPending || !g_DoorSaveValid) return FALSE;
-
-    BOOL ok = FALSE;
-    __try {
-        ok = WriteSaveBufferToDisk((void*)g_DoorSaveImage, g_DoorSaveChapter);
-    } __except (ExcFilter(GetExceptionInformation(), "FlushDoorSaveNow")) {
-        *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
-        *(BYTE*)ADDR_BACKUP_PACKED_VAL  = 0;
-        ok = FALSE;
-    }
-
-    if (ok) {
-        g_DoorSaveFlushPending = FALSE;
-        g_DoorSaveWritten = TRUE;
-        g_DoorSeqTick = GetTickCount();
-        Log("[Autosave] [DoorSeq] Early flush completed (Chapter %u, Room 0x%04X, Pos [%.1f, %.1f, %.1f])\n",
-            g_DoorSaveChapter, g_DoorSaveRoom,
-            g_DoorSavePos[0], g_DoorSavePos[1], g_DoorSavePos[2]);
-    } else {
-        // Do not retry every frame: let the normal deferred SRC_DOOR path retry
-        // once the game reports a safe state.
-        g_DoorSaveFlushPending = FALSE;
-        g_DoorSaveWritten = FALSE;
-        Log("[Autosave] [DoorSeq] Early flush failed; deferred SRC_DOOR save will retry\n");
-    }
-    return ok;
 }
 
 // Drops the frozen door-sequence image. Used when the sequence expires or a
 // new live save supersedes it, so later room-change saves cannot reuse stale
 // pre-door data.
 static void ClearDoorSequence(const char* why) {
-    if (g_DoorSaveValid || g_DoorSeqActive || g_DoorSaveFlushPending) {
+    if (g_DoorSaveValid || g_DoorSeqActive) {
         Log("[Autosave] [DoorSeq] Clearing frozen snapshot (%s)\n", why);
     }
     g_DoorSaveValid        = FALSE;
     g_DoorSaveWritten      = FALSE;
     g_DoorSeqActive        = FALSE;
     g_DoorSeqTrig          = NULL;
-    g_DoorSaveFlushPending = FALSE;
 }
 
 // Drops the frozen snapshot and cancels any pending deferred SRC_DOOR save, so
@@ -1634,7 +1778,6 @@ static BOOL DoAutosave(int saveSrc) {
             if (saveSrc == SRC_DOOR && usedDoorSeq) {
                 // Keep the frozen image and cover active: the room-change events
                 // that follow this door must not overwrite the pre-door position.
-                g_DoorSaveFlushPending = FALSE;
                 g_DoorSaveWritten = TRUE;
                 g_DoorSeqTick = GetTickCount();
             } else {
@@ -1653,10 +1796,53 @@ static BOOL DoAutosave(int saveSrc) {
 
 extern "C" void __cdecl QueueSaveC(int src);
 
+// Packs live pre-mutation state directly into g_DoorSaveImage when safe at 0x002DF46E.
+static BOOL CaptureLiveDoorSequenceSnapshot(const BYTE* trig) {
+    if (!IsInActiveGameplayFrame()) return FALSE;
+    DWORD now = GetTickCount();
+    AbandonDoorSequence("new live door capture");
+
+    BYTE liveTrigState = 0xFF;
+    __try {
+        liveTrigState = *(const BYTE*)(trig + 0x24);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        liveTrigState = 0xFF;
+    }
+
+    InterlockedExchange(&g_InSnapshot, 1);
+    BOOL packedOk = FALSE;
+    __try {
+        PackLiveToBuffer(g_DoorSaveImage, &g_DoorSaveRoom, g_DoorSavePos,
+                         &g_DoorSaveChapter, &g_DoorSaveDiff, &g_DoorSaveHP, NULL);
+        packedOk = TRUE;
+    } __except (ExcFilter(GetExceptionInformation(), "CaptureLiveDoorSequenceSnapshot")) {
+        *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
+        *(BYTE*)ADDR_BACKUP_PACKED_VAL  = 0;
+        packedOk = FALSE;
+    }
+    InterlockedExchange(&g_InSnapshot, 0);
+    if (!packedOk) return FALSE;
+
+    ResetSavedDoorTriggerState(trig, g_DoorSaveRoom, liveTrigState);
+
+    g_DoorSaveValid        = TRUE;
+    g_DoorSaveWritten      = FALSE;
+    g_DoorSaveCapturedTick = now;
+    g_DoorSeqActive        = TRUE;
+    g_DoorSeqTick          = now;
+    g_DoorSeqTrig          = trig;
+
+    Log("[Autosave] [DoorSeq] Frozen pre-door snapshot (source=live-pre-mutation, state=0x%02X, Chapter %u, Diff %u, Room 0x%04X, Pos [%.1f, %.1f, %.1f], HP %u)\n",
+        liveTrigState, g_DoorSaveChapter, g_DoorSaveDiff, g_DoorSaveRoom,
+        g_DoorSavePos[0], g_DoorSavePos[1], g_DoorSavePos[2], g_DoorSaveHP);
+    return TRUE;
+}
+
 // Captures a frozen pre-door image before DoorInteract_2DF3C0 mutates any
-// trigger or room flags. The actual disk write is deferred to PumpC
-// (FlushDoorSaveNow / DoAutosave) so we never block inside the SOBJ loop.
-static BOOL SavePreDoorNow(const BYTE* trig) {
+// trigger or room flags, then tries to write it to disk synchronously BEFORE
+// the door action list runs. If the write is not safe, the same frozen image
+// is queued and written once the game settles.
+static BOOL SavePreDoorNow(const BYTE* trig, BOOL preferRollingSnapshot) {
     DWORD now = GetTickCount();
     g_GameTid = GetCurrentThreadId();
 
@@ -1665,28 +1851,80 @@ static BOOL SavePreDoorNow(const BYTE* trig) {
         return FALSE;
     }
 
-    BOOL captured = CaptureDoorSequenceSnapshot(trig);
-
-    g_DoorInteractTick = now;
-
     if (g_PendingLoad) {
         Log("[Autosave] [DoorSeq] save not queued while autoload is pending\n");
+        g_DoorInteractTick = 0;
         AbandonDoorSequence("autoload pending");
         return FALSE;
     }
 
+    BOOL captured = FALSE;
+    if (!preferRollingSnapshot && *(volatile DWORD*)ADDR_SAVE_POOL == 0 &&
+        IsSafeToSaveNow(NULL, TRUE, TRUE, TRUE)) {
+        captured = CaptureLiveDoorSequenceSnapshot(trig);
+    }
     if (!captured) {
-        // Never queue a live save on capture failure: by the time it runs the
-        // player may already be inside the destination room, which is exactly
-        // the bug this snapshot exists to prevent. Keep the previous file.
-        Log("[Autosave] [DoorSeq] capture failed; not queueing a live save\n");
+        captured = CaptureDoorSequenceSnapshot(trig);
+    }
+
+    if (!captured) {
+        // Never queue a live save when no usable pre-door snapshot exists: by
+        // the time it runs the player may already be inside the destination
+        // room, or the door may already be in a used state. Keep the previous
+        // consistent quick save.
+        Log("[Autosave] [DoorSeq] no usable pre-door snapshot; keeping previous quick save\n");
         g_DoorInteractTick = 0;
-        AbandonDoorSequence("capture failed");
+        AbandonDoorSequence("no usable pre-door snapshot");
         return FALSE;
     }
 
-    // Queue the save even if the early flush will handle it: this keeps a
-    // deferred fallback in case the frozen image cannot be written immediately.
+    // Save first, then open the door. This hook is still before the action
+    // list at 0x2DF4C0. The SOBJ-loop RoomTransition flag is a false positive
+    // here, and the interaction locks only describe gameplay input, so both
+    // are ignored for this frozen-image write.
+    const char* syncWhy = NULL;
+    if (*(volatile DWORD*)ADDR_SAVE_POOL != 0) {
+        syncWhy = "SavePoolBusy";
+    } else if (!IsSafeToSaveNow(&syncWhy, TRUE, TRUE, TRUE)) {
+        // syncWhy populated by IsSafeToSaveNow
+    }
+
+    if (syncWhy == NULL) {
+        DWORD syncStart = GetTickCount();
+        LONG prevInPump = InterlockedExchange(&g_InPump, 1);
+        BOOL syncOk = FALSE;
+        __try {
+            syncOk = WriteSaveBufferToDisk((void*)g_DoorSaveImage, g_DoorSaveChapter);
+        } __except (ExcFilter(GetExceptionInformation(), "SavePreDoorNow")) {
+            *(BYTE*)ADDR_FIELD_PACKED_VALID = 0;
+            *(BYTE*)ADDR_BACKUP_PACKED_VAL  = 0;
+            syncOk = FALSE;
+        }
+        InterlockedExchange(&g_InPump, prevInPump);
+
+        if (syncOk) {
+            g_DoorSaveWritten = TRUE;
+            g_DoorSeqTick = now;
+            g_DoorInteractTick = now;
+            InterlockedIncrement(&g_HookCount[SRC_DOOR]);
+            // The pre-door save is newer than any save that was already queued
+            // (e.g. the delayed level-start autosave); let it win.
+            InterlockedExchange(&g_PendingSave, 0);
+            InterlockedExchange(&g_PendingSaveSrc, 0);
+            Log("[Autosave] [DoorSeq] Pre-door sync save completed BEFORE door action (took %ums, Chapter %u, Room 0x%04X, Pos [%.1f, %.1f, %.1f])\n",
+                GetTickCount() - syncStart, g_DoorSaveChapter, g_DoorSaveRoom,
+                g_DoorSavePos[0], g_DoorSavePos[1], g_DoorSavePos[2]);
+            return TRUE;
+        }
+        Log("[Autosave] [DoorSeq] Pre-door sync save failed after %ums; falling back to deferred SRC_DOOR\n",
+            GetTickCount() - syncStart);
+    } else {
+        Log("[Autosave] [DoorSeq] Pre-door sync save skipped (%s); falling back to deferred SRC_DOOR\n", syncWhy);
+    }
+
+    g_DoorInteractTick = now;
+
+    // Queue the deferred fallback with the same frozen pre-door image.
     QueueSaveC(SRC_DOOR);
     if (!g_PendingSave) {
         // QueueSaveC may have debounced this as a duplicate room-change event;
@@ -1701,8 +1939,43 @@ static BOOL SavePreDoorNow(const BYTE* trig) {
 // Drops all pre-door/quick-save snapshot state before any checkpoint load.
 static void ResetDoorStateForLoad(const char* why) {
     g_PreDoorImageValid = FALSE;
+    g_PrevPreDoorImageValid = FALSE;
+    g_PrevPreDoorTick = 0;
     AbandonDoorSequence(why);
     g_DoorInteractTick = 0;
+
+    // A stale interaction/button global from the door action that preceded F9
+    // must not be visible to the first SOBJ update after the load.
+    __try {
+        *(DWORD*)0x00D52CE8 = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Normalizes the live SOBJ trigger state for the door that produced the quick
+// save. In-progress state (2) is restored to armed/idle (1), never 3 (dead).
+static void ResetLiveDoorTriggerAfterLoad(const BYTE* trig, WORD doorRoom, WORD loadedRoom) {
+    if (!trig || doorRoom != loadedRoom) return;
+
+    // Apply again on the first active gameplay frame: State 9/unpack can run
+    // after this hook and restore the state byte from the save image.
+    g_PostLoadDoorTrig = trig;
+    g_PostLoadDoorRoom = loadedRoom;
+    g_PostLoadDoorResetPending = TRUE;
+    g_PostLoadDoorResetRoomTick = 0;
+    g_PostLoadDoorCheckDone = FALSE;
+    g_LastLoadTick = GetTickCount();
+
+    __try {
+        BYTE old = *(BYTE*)(trig + 0x24);
+        *(BYTE*)(trig + 0x24) = (old == 2) ? 1 : old;
+        *(DWORD*)(trig + 0x0C) = 0;
+        *(DWORD*)0x00D52CE8 = 0;
+        Log("[Autosave] [DoorSeq] Live trigger normalized after load (trig=%p, room=0x%04X): state 0x%02X -> 0x%02X\n",
+            trig, doorRoom, old, *(BYTE*)(trig + 0x24));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[Autosave] [DoorSeq] Live trigger reset skipped (invalid trig=%p)\n", trig);
+    }
 }
 
 // Intercepts State 9 Case 3/4 checkpoint file loader (0x0016656A).
@@ -1711,9 +1984,13 @@ extern "C" int __cdecl Hook_CheckpointLoad_Impl(int slotIdx) {
         if (!g_AutosaveValid || !g_SlotPath[0]) {
             Log("[Autosave] Autoload requested but no valid slot exists, falling back to native checkpoint\n");
             g_AutoloadPending = 0;
+            const BYTE* lastTrig = g_DoorSeqTrig;
+            WORD lastDoorRoom = g_DoorSaveRoom;
             ResetDoorStateForLoad("native checkpoint load (no autosave slot)");
             typedef int (__cdecl *PFN_LoadCheckpoint)(int);
-            return ((PFN_LoadCheckpoint)0x0016B680)(slotIdx);
+            int loadRes = ((PFN_LoadCheckpoint)0x0016B680)(slotIdx);
+            ResetLiveDoorTriggerAfterLoad(lastTrig, lastDoorRoom, *(WORD*)ADDR_FIELD_SAVED_ROOM);
+            return loadRes;
         }
         Log("[Autosave] State 9 Case 4: loading autosave from '%s' into 0x00572F40...\n", g_SlotPath);
         const char* path = g_SlotPath;
@@ -1770,7 +2047,10 @@ extern "C" int __cdecl Hook_CheckpointLoad_Impl(int slotIdx) {
             g_LastLoadTick    = GetTickCount();
             g_LastRoomId      = savedRoom;
             g_CurrentChapter  = loadedChapter;
+            const BYTE* lastTrig = g_DoorSeqTrig;
+            WORD lastDoorRoom = g_DoorSaveRoom;
             ResetDoorStateForLoad("autoload");
+            ResetLiveDoorTriggerAfterLoad(lastTrig, lastDoorRoom, savedRoom);
             g_AutoloadPending = 0;
 
             Log("[Autosave] Autoload successful (Chapter %u, Room 0x%04X, Spawn 0x%04X, Packed %u) -> resuming via State 9 -> State 5\n",
@@ -1779,15 +2059,23 @@ extern "C" int __cdecl Hook_CheckpointLoad_Impl(int slotIdx) {
         }
         Log("[Autosave] Autoload failed with code: %d, falling back to native checkpoint\n", res);
         g_AutoloadPending = 0;
+        const BYTE* lastTrig = g_DoorSeqTrig;
+        WORD lastDoorRoom = g_DoorSaveRoom;
         ResetDoorStateForLoad("native checkpoint load (autoload failed)");
         typedef int (__cdecl *PFN_LoadCheckpoint)(int);
-        return ((PFN_LoadCheckpoint)0x0016B680)(slotIdx);
+        int loadRes = ((PFN_LoadCheckpoint)0x0016B680)(slotIdx);
+        ResetLiveDoorTriggerAfterLoad(lastTrig, lastDoorRoom, *(WORD*)ADDR_FIELD_SAVED_ROOM);
+        return loadRes;
     }
 
     // Normal checkpoint load: call original 0x0016B680
+    const BYTE* lastTrig = g_DoorSeqTrig;
+    WORD lastDoorRoom = g_DoorSaveRoom;
     ResetDoorStateForLoad("native checkpoint load");
     typedef int (__cdecl *PFN_LoadCheckpoint)(int);
-    return ((PFN_LoadCheckpoint)0x0016B680)(slotIdx);
+    int loadRes = ((PFN_LoadCheckpoint)0x0016B680)(slotIdx);
+    ResetLiveDoorTriggerAfterLoad(lastTrig, lastDoorRoom, *(WORD*)ADDR_FIELD_SAVED_ROOM);
+    return loadRes;
 }
 
 extern "C" void __cdecl QueueSaveC(int src) {
@@ -1862,7 +2150,11 @@ extern "C" void __cdecl PumpC() {
         g_LastEnemyCount = 0;
         g_DoorInteractTick = 0;
         AbandonDoorSequence("returned to menus");
+        g_PostLoadDoorResetPending = FALSE;
+        g_PostLoadDoorResetRoomTick = 0;
         g_PreDoorImageValid = FALSE;
+        g_PrevPreDoorImageValid = FALSE;
+        g_PrevPreDoorTick = 0;
     }
 
     if (g_DoorSeqActive) {
@@ -1871,7 +2163,9 @@ extern "C" void __cdecl PumpC() {
                              IsCutscenePlayingNow() ||
                              *(BYTE*)ADDR_ROOM_TRANSITION != 0 ||
                              *(BYTE*)ADDR_STATE_TRIGGER != 0 ||
-                             *(BYTE*)ADDR_FIELD_CHAP_TRANS != 0;
+                             *(BYTE*)ADDR_FIELD_CHAP_TRANS != 0 ||
+                             *(BYTE*)ADDR_RYU_EVENT_LOCK != 0 ||
+                             (*(DWORD*)0x00C0611C & 1) != 0;
         if (transitioning) {
             // Do not age out during a long load/cutscene/pause/Game Over; the
             // player must still be able to F9 back to the pre-door state.
@@ -1883,6 +2177,73 @@ extern "C" void __cdecl PumpC() {
         if (now - g_DoorSaveCapturedTick >= 60000 &&
             !(g_PendingSave && (int)g_PendingSaveSrc == SRC_DOOR)) {
             ClearDoorSequence("sequence hard timeout");
+        }
+    }
+
+    // Post-load door trigger guard: the load hook and the room-unpack pass can
+    // both restore a serialized "door active" state. Keep forcing the last door
+    // trigger to idle for a short window after the destination room appears, so
+    // the first SOBJ updates cannot auto-execute the door action. This also
+    // repairs older quick saves written before the state-byte patch existed.
+    if (g_PostLoadDoorResetPending) {
+        DWORD elapsed = now - g_LastLoadTick;
+        if (gstate == 5 || gstate == 0x0C) {
+            WORD curRoom = *(WORD*)ADDR_CURRENT_ROOM;
+            if (curRoom == g_PostLoadDoorRoom) {
+                float dx = *(float*)(ADDR_RYU_POS + 0) - g_DoorSavePos[0];
+                float dy = *(float*)(ADDR_RYU_POS + 4) - g_DoorSavePos[1];
+                float dz = *(float*)(ADDR_RYU_POS + 8) - g_DoorSavePos[2];
+                BOOL nearSavedPos = (dx * dx + dy * dy + dz * dz) < (10.0f * 10.0f);
+                if (nearSavedPos) {
+                    if (g_PostLoadDoorResetRoomTick == 0) {
+                        g_PostLoadDoorResetRoomTick = now;
+                    }
+                    __try {
+                        BYTE old = *(BYTE*)(g_PostLoadDoorTrig + 0x24);
+                        *(BYTE*)(g_PostLoadDoorTrig + 0x24) = (old == 2) ? 1 : old;
+                        *(DWORD*)(g_PostLoadDoorTrig + 0x0C) = 0;
+                        *(DWORD*)0x00D52CE8 = 0;
+                        Log("[Autosave] [DoorSeq] Post-load trigger normalized (trig=%p, room=0x%04X, pos [%.1f, %.1f, %.1f]): state 0x%02X -> 0x%02X\n",
+                            g_PostLoadDoorTrig, g_PostLoadDoorRoom,
+                            *(float*)(ADDR_RYU_POS + 0), *(float*)(ADDR_RYU_POS + 4), *(float*)(ADDR_RYU_POS + 8),
+                            old, *(BYTE*)(g_PostLoadDoorTrig + 0x24));
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        Log("[Autosave] [DoorSeq] Post-load trigger reset skipped (invalid trig=%p)\n",
+                            g_PostLoadDoorTrig);
+                    }
+                    g_PostLoadDoorResetPending = FALSE;
+                }
+            }
+        }
+        if (g_PostLoadDoorResetPending &&
+            g_PostLoadDoorResetRoomTick == 0 && elapsed > 5000) {
+            Log("[Autosave] [DoorSeq] Post-load trigger reset abandoned (room 0x%04X, doorRoom 0x%04X, pos [%.1f, %.1f, %.1f])\n",
+                *(WORD*)ADDR_CURRENT_ROOM, g_PostLoadDoorRoom,
+                *(float*)(ADDR_RYU_POS + 0), *(float*)(ADDR_RYU_POS + 4), *(float*)(ADDR_RYU_POS + 8));
+            g_PostLoadDoorResetPending = FALSE;
+        }
+    }
+
+    // One-shot live-state probe when the player reaches the saved door area
+    // after a load: shows whether the game re-activated or reverted the door.
+    if (!g_PostLoadDoorCheckDone && g_PostLoadDoorTrig &&
+        (gstate == 5 || gstate == 0x0C)) {
+        float ldx = *(float*)(ADDR_RYU_POS + 0) - g_DoorSavePos[0];
+        float ldy = *(float*)(ADDR_RYU_POS + 4) - g_DoorSavePos[1];
+        float ldz = *(float*)(ADDR_RYU_POS + 8) - g_DoorSavePos[2];
+        if ((ldx * ldx + ldy * ldy + ldz * ldz) < (3.0f * 3.0f)) {
+            __try {
+                BYTE* p = (BYTE*)(g_PostLoadDoorTrig + 0x24);
+                Log("[Autosave] [DoorLive] near door pos [%.1f, %.1f, %.1f] state=0x%02X cursor=%d prompt=0x%X bytes=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                    *(float*)(ADDR_RYU_POS + 0), *(float*)(ADDR_RYU_POS + 4), *(float*)(ADDR_RYU_POS + 8),
+                    p[0], *(DWORD*)(g_PostLoadDoorTrig + 0x0C), *(DWORD*)0x00D52CE8,
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log("[Autosave] [DoorLive] probe skipped (invalid trig=%p)\n", g_PostLoadDoorTrig);
+            }
+            g_PostLoadDoorCheckDone = TRUE;
+        } else if ((DWORD)(now - g_LastLoadTick) > 10000) {
+            g_PostLoadDoorCheckDone = TRUE;
         }
     }
 
@@ -2000,6 +2361,18 @@ extern "C" void __cdecl PumpC() {
         if ((g_PendingSave == 0 || pendingDoorAlreadyFlushed) && g_PendingLoad == 0 &&
             *(volatile DWORD*)ADDR_SAVE_POOL == 0 &&
             (now - g_LastSnapshotTick >= 350) && IsSafeToSaveNow(NULL)) {
+            if (g_PreDoorImageValid) {
+                memcpy(g_PrevPreDoorImage, g_PreDoorImage, SIZE_SAVE_IMAGE);
+                g_PrevPreDoorRoom    = g_PreDoorRoom;
+                g_PrevPreDoorPos[0]  = g_PreDoorPos[0];
+                g_PrevPreDoorPos[1]  = g_PreDoorPos[1];
+                g_PrevPreDoorPos[2]  = g_PreDoorPos[2];
+                g_PrevPreDoorChapter = g_PreDoorChapter;
+                g_PrevPreDoorDiff    = g_PreDoorDiff;
+                g_PrevPreDoorHP      = g_PreDoorHP;
+                g_PrevPreDoorTick    = g_LastSnapshotTick;
+                g_PrevPreDoorImageValid = TRUE;
+            }
             InterlockedExchange(&g_InSnapshot, 1);
             PackLiveToBuffer(g_PreDoorImage, &g_PreDoorRoom, g_PreDoorPos,
                              &g_PreDoorChapter, &g_PreDoorDiff, &g_PreDoorHP, NULL);
@@ -2009,7 +2382,7 @@ extern "C" void __cdecl PumpC() {
         }
     }
 
-    if (!(g_PendingSave | g_PendingLoad | (LONG)g_DoorSaveFlushPending)) return;
+    if (!(g_PendingSave | g_PendingLoad)) return;
 
     // Never allow a Quickload request pressed on Title / Load Game / Cutscene menus to stay armed as a trap!
     if (g_PendingLoad && gstate != 5 && gstate != 0x0C && subState != 0x80) {
@@ -2017,7 +2390,7 @@ extern "C" void __cdecl PumpC() {
             Log("[Autosave] Discarded Quickload request outside gameplay/GameOver (GlobalState=%u, SubState=0x%02X)\n",
                 gstate, subState);
         }
-        if (!g_PendingSave && !g_DoorSaveFlushPending) return;
+        if (!g_PendingSave) return;
     }
 
     // Never interrupt the game's own save routine (it owns the global pool while running)
@@ -2031,22 +2404,6 @@ extern "C" void __cdecl PumpC() {
     }
 
     g_InPump = 1;
-
-    // Write the frozen door-sequence image as soon as the game returns to a
-    // function boundary after the trigger. This happens before the destination
-    // room is fully entered, so death or an immediate F9 still finds the
-    // pre-door state on disk. The frozen image itself was captured before the
-    // door action mutated any trigger/room state.
-    BYTE flushTaskState   = *(BYTE*)ADDR_TASK1_STATE;
-    BYTE flushStateTrigger = *(BYTE*)ADDR_STATE_TRIGGER;
-    BOOL flushStateOk = (subState == 0x80) ||
-                        ((gstate == 5 || gstate == 0x0C) &&
-                         flushTaskState == 1 && subState == 3 && flushStateTrigger == 0 &&
-                         *(BYTE*)ADDR_FIELD_CHAP_TRANS == 0);
-    if (g_DoorSaveFlushPending && g_DoorSaveValid && flushStateOk &&
-        *(BYTE*)ADDR_PAUSE_DEPTH == 0) {
-        FlushDoorSaveNow();
-    }
 
     if (g_PendingLoad) {
         BYTE taskState = *(BYTE*)ADDR_TASK1_STATE;
@@ -2127,17 +2484,93 @@ static void __declspec(naked) Hook_DoorEnter_Stub() {
     }
 }
 
-static BOOL IsExcludedNonDoorOpcode(DWORD op) {
-    return (op == 0x82000131 || // chest
-            op == 0x82000123 || // Dragon Statue
+static BOOL IsHardExcludedNonDoorOpcode(DWORD op) {
+    return (op == 0x82000123 || // Dragon Statue
             op == 0x82000122 || // Muramasa Shop
             op == 0x82000121 || // UI / save menu
             op == 0x82000111 || // examine / text dialog
             op == 0x82000115 || // Ch6 chalice altar
             op == 0x8200011F || // missing item / locked prompt
             op == 0x82000083 || // key / prompt UI
-            op == 0x820000AE || // statue / orb restore
-            op == 0x820000AC);  // statue / orb restore
+            op == 0x820000ED || // give item
+            op == 0x8200011D);  // chest model open
+}
+
+// These opcodes appear in chests/statues, but also legitimately appear inside
+// direct-animation sliding door triggers that move Ryu with MOVE_RYU (0x820000DC).
+static BOOL IsSoftDoorAnimOpcode(DWORD op) {
+    return (op == 0x82000131 || // chest open / player door-slide anim
+            op == 0x820000AE || // statue restore / lock player control
+            op == 0x820000AC);  // statue restore / lock camera
+}
+
+// Checks whether a trigger's condition bytecode contains any spatial/area/proximity
+// opcode (0x8200001F .. 0x82000025). Triggers without spatial conditions (such as
+// room-wide 4F(0x11) skip/reset helpers) can fire anywhere on A/X button presses.
+static BOOL HasSpatialCondition(const DWORD* cond, const DWORD* act) {
+    if (!cond) return FALSE;
+    int maxDwords = 256;
+    if (act && act > cond) {
+        size_t diff = (size_t)(act - cond);
+        if (diff < (size_t)maxDwords) maxDwords = (int)diff;
+    }
+    for (int i = 0; i < maxDwords; ++i) {
+        DWORD op = cond[i];
+        if (op == 0x82000142) break;
+        if (op >= 0x8200001F && op <= 0x82000025) return TRUE;
+    }
+    return FALSE;
+}
+
+// Inspects a target trigger activated via 0x820000D6 <idx> 1 (e.g. Ninja Fortress
+// sliding fusuma doors where the button trigger only enables the door-walk animation trigger).
+static BOOL IsRelayDoorTarget(DWORD targetIdx, int depth) {
+    if (depth > 2 || targetIdx >= 0x380) return FALSE;
+    const BYTE* tTrig = (const BYTE*)(0x00D53320 + targetIdx * 0x68);
+    if (*(const DWORD*)tTrig == 0) return FALSE;
+    const DWORD* tAct = *(const DWORD**)(tTrig + 8);
+    if (!tAct) return FALSE;
+
+    BOOL hasFade30 = FALSE;
+    BOOL hasAnyFadeB6 = FALSE;
+    BOOL hasMoveRyuDC = FALSE;
+    BOOL hasObjAnim5B = FALSE;
+    BOOL hasOp73 = FALSE;
+    BOOL hasSwitch13B = FALSE;
+    DWORD subTarget = 0xFFFFFFFF;
+
+    for (int i = 0; i < 256; ++i) {
+        DWORD op = tAct[i];
+        if (op == 0x82000142) break;
+        if (IsHardExcludedNonDoorOpcode(op)) {
+            return FALSE;
+        }
+        if (op == 0x820000B6) {
+            hasAnyFadeB6 = TRUE;
+            if (i + 1 < 256 && tAct[i + 1] == 0x0000001E) hasFade30 = TRUE;
+        } else if (op == 0x820000DC) {
+            hasMoveRyuDC = TRUE;
+        } else if (op == 0x8200005B) {
+            hasObjAnim5B = TRUE;
+        } else if (op == 0x82000073) {
+            hasOp73 = TRUE;
+        } else if (op == 0x8200013B) {
+            hasSwitch13B = TRUE;
+        } else if (op == 0x820000D6 && i + 2 < 256 && tAct[i + 2] == 1 && tAct[i + 1] < 0x380) {
+            if (subTarget == 0xFFFFFFFF && tAct[i + 1] != targetIdx) {
+                subTarget = tAct[i + 1];
+            }
+        }
+    }
+
+    if (hasFade30 || hasSwitch13B ||
+        (hasMoveRyuDC && (hasObjAnim5B || hasOp73 || hasAnyFadeB6))) {
+        return TRUE;
+    }
+    if (depth < 1 && subTarget != 0xFFFFFFFF) {
+        return IsRelayDoorTarget(subTarget, depth + 1);
+    }
+    return FALSE;
 }
 
 extern "C" void __cdecl OnDoorInteractCheckC(const BYTE* trig) {
@@ -2149,25 +2582,35 @@ extern "C" void __cdecl OnDoorInteractCheckC(const BYTE* trig) {
         DWORD actCursor = *(const DWORD*)(trig + 0x0C);
         if (trigState != 1 && actCursor != 0) return;
 
+        const DWORD* cond = *(const DWORD**)(trig + 4);
         const DWORD* act = *(const DWORD**)(trig + 8);
         if (!act) return;
 
         DWORD promptPressed = *(const DWORD*)0x00D52CE8;
-        BOOL excluded = FALSE;
+        BOOL hardExcluded = FALSE;
+        BOOL softExcluded = FALSE;
         BOOL hasFade30 = FALSE;
         BOOL hasAnyFadeB6 = FALSE;
         BOOL hasTeleport66 = FALSE;
+        BOOL hasMoveRyuDC = FALSE;
         BOOL hasObjAnim5B = FALSE;
+        BOOL hasOp73 = FALSE;
         BOOL hasRoomPrep13D = FALSE;
         BOOL hasAnySwitch13B = FALSE;
         BOOL hasImmediateSwitch13B = FALSE;
+        DWORD relayTargets[4] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
+        int relayCount = 0;
 
         for (int i = 0; i < 256; ++i) {
             DWORD op = act[i];
             if (op == 0x82000142) break;
-            if (IsExcludedNonDoorOpcode(op)) {
-                excluded = TRUE;
+            if (IsHardExcludedNonDoorOpcode(op)) {
+                hardExcluded = TRUE;
                 break;
+            }
+            if (IsSoftDoorAnimOpcode(op)) {
+                softExcluded = TRUE;
+                continue;
             }
             if (op == 0x820000B6) {
                 hasAnyFadeB6 = TRUE;
@@ -2176,8 +2619,12 @@ extern "C" void __cdecl OnDoorInteractCheckC(const BYTE* trig) {
                 }
             } else if (op == 0x82000066) {
                 hasTeleport66 = TRUE;
+            } else if (op == 0x820000DC) {
+                hasMoveRyuDC = TRUE;
             } else if (op == 0x8200005B) {
                 hasObjAnim5B = TRUE;
+            } else if (op == 0x82000073) {
+                hasOp73 = TRUE;
             } else if (op == 0x8200013D) {
                 hasRoomPrep13D = TRUE;
             } else if (op == 0x8200013B) {
@@ -2185,33 +2632,63 @@ extern "C" void __cdecl OnDoorInteractCheckC(const BYTE* trig) {
                 if (i < 24) {
                     hasImmediateSwitch13B = TRUE;
                 }
+            } else if (op == 0x820000D6 && i + 2 < 256 && act[i + 2] == 1 && act[i + 1] < 0x380) {
+                if (relayCount < 4) {
+                    relayTargets[relayCount++] = act[i + 1];
+                }
             }
         }
 
-        if (excluded) return;
+        if (hardExcluded) return;
 
-        BOOL isFadeDoor   = (promptPressed != 0 && hasFade30);
-        BOOL isAnimDoor   = (promptPressed != 0 && hasTeleport66 &&
+        BOOL hasSpatialCond = HasSpatialCondition(cond, act);
+        BOOL allowPromptDoor = (promptPressed != 0 && hasSpatialCond);
+
+        BOOL isDirectAnimDoor = (allowPromptDoor && hasMoveRyuDC &&
+                                 (hasObjAnim5B || hasOp73 || hasAnyFadeB6));
+        if (softExcluded && !isDirectAnimDoor) return;
+
+        BOOL isFadeDoor   = (allowPromptDoor && !softExcluded && hasFade30);
+        BOOL isAnimDoor   = (allowPromptDoor && !softExcluded && hasTeleport66 &&
                              (hasObjAnim5B || hasRoomPrep13D || hasAnySwitch13B || hasAnyFadeB6));
-        BOOL isWalkPortal = hasImmediateSwitch13B;
-        if (!isFadeDoor && !isAnimDoor && !isWalkPortal) return;
+        BOOL isRelayDoor  = FALSE;
+        if (allowPromptDoor && !softExcluded && !isFadeDoor && !isAnimDoor &&
+            !isDirectAnimDoor && relayCount > 0) {
+            for (int r = 0; r < relayCount; ++r) {
+                if (IsRelayDoorTarget(relayTargets[r], 0)) {
+                    isRelayDoor = TRUE;
+                    break;
+                }
+            }
+        }
+        BOOL isWalkPortal = (!softExcluded && hasImmediateSwitch13B);
+        if (!isFadeDoor && !isAnimDoor && !isRelayDoor && !isDirectAnimDoor && !isWalkPortal) return;
 
         DWORD now = GetTickCount();
         if (trig == g_DoorSeqTrig && (now - g_DoorSeqTick < 3000)) {
             return;
         }
-        // Avoid overwriting a fresh pre-door snapshot with a secondary portal
-        // during the same door transition. A different trigger with a pressed
-        // prompt is allowed to start a new door sequence.
-        if (g_DoorSeqActive && g_DoorSaveValid && (now - g_DoorSeqTick < 5000) &&
-            !(promptPressed != 0 && trig != g_DoorSeqTrig)) {
-            return;
+        // Do not start a second capture while a door animation/transition from the
+        // current sequence is already underway (e.g. an auxiliary 4F(0x11) skip/fade
+        // trigger firing mid-animation after MOVE_RYU 0xDC has begun).
+        if (g_DoorSeqActive && g_DoorSaveValid && (now - g_DoorSeqTick < 5000)) {
+            BOOL midAnimOrTransition = (*(BYTE*)ADDR_RYU_EVENT_LOCK != 0) ||
+                                       ((*(DWORD*)0x00C0611C & 1) != 0) ||
+                                       (*(BYTE*)ADDR_ROOM_TRANSITION != 0);
+            if (midAnimOrTransition || !(promptPressed != 0 && trig != g_DoorSeqTrig)) {
+                return;
+            }
         }
 
-        const char* kind = isFadeDoor ? "Fade" : (isAnimDoor ? "Anim/Unbar" : "Portal");
-        Log("[Autosave] Pre-mutation door trigger detected (%s, trig=%p, act=%p, prompt=%u)\n",
-            kind, trig, act, promptPressed);
-        SavePreDoorNow(trig);
+        const char* kind = isFadeDoor ? "Fade"
+                         : (isAnimDoor ? "Anim/Unbar"
+                         : (isRelayDoor ? "Sliding/Relay"
+                         : (isDirectAnimDoor ? "Sliding/Direct" : "Portal")));
+        Log("[Autosave] Pre-mutation door trigger detected (%s, trig=%p, act=%p, prompt=%u, state=%u, cursor=%u)\n",
+            kind, trig, act, promptPressed, (unsigned)trigState, (unsigned)actCursor);
+
+        BOOL preferRollingSnapshot = (!isFadeDoor && !isAnimDoor && !isRelayDoor && !isDirectAnimDoor);
+        SavePreDoorNow(trig, preferRollingSnapshot);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
